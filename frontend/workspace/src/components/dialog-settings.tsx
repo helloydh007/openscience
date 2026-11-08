@@ -14,9 +14,7 @@ import {
 } from "./settings/registry"
 import { SettingsNavContext } from "./settings/nav"
 import { SettingsPanelStack } from "./settings/panel-stack"
-import { settingsApi } from "./settings/api"
 import { useLanguage } from "@/context/language"
-import { useGlobalSDK } from "@/context/global-sdk"
 
 // Scoped to the settings dialog only. Gives shared primitives and legacy
 // panels one calm OpenScience hierarchy, grid, and surface stack without
@@ -1607,36 +1605,18 @@ export const SETTINGS_STYLES = `
 }
 `
 
-type FooterAccount = { session: boolean; user?: { email?: string } }
-
-/** The signed-in person and the app version, as the rail's last row. */
-const SettingsAccountFooter: Component<{ version?: string; onOpen: () => void }> = (props) => {
-  const sdk = useGlobalSDK()
-  const platform = usePlatform()
-  const [account, setAccount] = createSignal<FooterAccount>()
-  const load = () =>
-    settingsApi<FooterAccount>(sdk.url, platform.fetch ?? fetch, "/account")
-      .then(setAccount)
-      .catch(() => undefined)
-  onMount(() => {
-    void load()
-    window.addEventListener("openscience:account-changed", load)
-  })
-  onCleanup(() => window.removeEventListener("openscience:account-changed", load))
-  const email = () => (account()?.session ? account()?.user?.email || "Signed in" : undefined)
-  const initial = () => (email() ?? "O").trim().charAt(0).toUpperCase()
-  return (
-    <button type="button" class="settings-nav__footer" onClick={() => props.onOpen()} aria-label="Open Ace account">
-      <span class="settings-nav__avatar" aria-hidden="true">
-        {initial()}
-      </span>
-      <span class="settings-nav__identity">
-        <span class="settings-nav__identity-name">{email() ?? "Not signed in"}</span>
-        <span class="settings-nav__identity-meta">OpenScience{props.version ? ` v${props.version}` : ""}</span>
-      </span>
-    </button>
-  )
-}
+/** Local-first build status and the app version, as the rail's last row. */
+const SettingsAccountFooter: Component<{ version?: string; onOpen: () => void }> = (props) => (
+  <button type="button" class="settings-nav__footer" onClick={() => props.onOpen()} aria-label="Open settings">
+    <span class="settings-nav__avatar" aria-hidden="true">
+      O
+    </span>
+    <span class="settings-nav__identity">
+      <span class="settings-nav__identity-name">Local-first · bring your own key</span>
+      <span class="settings-nav__identity-meta">OpenScience{props.version ? ` v${props.version}` : ""}</span>
+    </span>
+  </button>
+)
 
 export const DialogSettings: Component<{ initial?: SettingsPanelId }> = (props) => {
   const language = useLanguage()
@@ -1808,7 +1788,7 @@ export const DialogSettings: Component<{ initial?: SettingsPanelId }> = (props) 
                 )}
               </For>
             </div>
-            <SettingsAccountFooter version={platform.version} onOpen={() => void navigate("ace")} />
+            <SettingsAccountFooter version={platform.version} onOpen={() => void navigate("general")} />
           </nav>
 
           {/* ── Right column ── */}

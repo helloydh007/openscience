@@ -23,6 +23,10 @@ export namespace KeyCheck {
     headers(key: string): Record<string, string>
     /** Environment variables that point this provider at another host. */
     base: string[]
+    /** The provider's own documented base URL. A config that points here is
+     * still the provider, not a user-supplied endpoint, so the key is safe to
+     * probe. */
+    canonicalBase?: string
     /** A refusal the provider does not report as 401. */
     refused?(response: Response): Promise<boolean>
   }
@@ -49,6 +53,13 @@ export namespace KeyCheck {
       url: "https://openrouter.ai/api/v1/key",
       headers: (key) => ({ authorization: `Bearer ${key}` }),
       base: ["OPENROUTER_BASE_URL"],
+    },
+    "opencode-go": {
+      name: "OpenCode Go",
+      url: "https://opencode.ai/zen/go/v1/models",
+      headers: (key) => ({ authorization: `Bearer ${key}` }),
+      base: [],
+      canonicalBase: "https://opencode.ai/zen/go/v1",
     },
     google: {
       name: "Google",
@@ -78,8 +89,19 @@ export namespace KeyCheck {
 
   function repointed(probe: Probe, providerID: string, config: Routing, env: Record<string, string | undefined>) {
     const entry = config.provider?.[providerID]
-    if (entry?.api || entry?.options?.["baseURL"]) return true
-    return probe.base.some((name) => !!env[name])
+    const baseURL = entry?.options?.["baseURL"] ?? entry?.api
+    if (typeof baseURL === "string") {
+      try {
+        const normalized = new URL(baseURL).href.replace(/\/+$/, "")
+        if (probe.canonicalBase && normalized === probe.canonicalBase) {
+          // Still the provider's own host: not a user-supplied endpoint.
+        } else return true
+      } catch {
+        return true
+      }
+    }
+    if (probe.base.some((name) => !!env[name])) return true
+    return false
   }
 
   export async function verify(input: {

@@ -95,9 +95,9 @@ export const dict = {
   "settings.search.loading": "Checking search setup…",
   "settings.search.error": "Could not read search status. Refresh to retry.",
   "settings.search.configured":
-    "Research search (research_search): Firecrawl or Ace is configured. A real search is still needed to check access and quota.",
+    "Research search (research_search): Firecrawl is configured. A real search is still needed to check access and quota.",
   "settings.search.missing":
-    "Research search (research_search): Missing Firecrawl or Ace credentials. Add Firecrawl in Customize → Credentials, or connect Ace in Wallet.",
+    "Research search (research_search): Missing a Firecrawl key. Add your own key in Customize → Credentials.",
   "settings.search.builtin":
     "Built in: literature for papers, webfetch for a known URL, and science_search / science_fetch for databases. These do not require a model-provider search add-on; source credentials and network rules still apply.",
   "settings.search.mcp":

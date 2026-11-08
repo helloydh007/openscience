@@ -9,9 +9,11 @@ import { confirmDialog } from "@/atlas/dialogs"
 import { useGlobalSDK } from "@/context/global-sdk"
 import { useGlobalSync } from "@/context/global-sync"
 import { useLanguage } from "@/context/language"
+import { usePlatform } from "@/context/platform"
 import { useProviders } from "@/hooks/use-providers"
 import type { dict } from "@/i18n/en"
 import { MODEL_PROVIDERS, MODEL_PROVIDER_LABELS, modelProvider } from "./model-providers"
+import { settingsApi } from "./api"
 import { ProviderLogo } from "./ProviderLogo"
 import { Icon } from "@synsci/ui/icon"
 
@@ -69,29 +71,87 @@ export function ProviderKeys(props: { onError?: (error: string | undefined) => v
   const providers = useProviders()
   const dialog = useDialog()
   const language = useLanguage()
+  const platform = usePlatform()
+  const fetchFn = platform.fetch ?? fetch
   const [form, setForm] = createStore({
     provider: MODEL_PROVIDERS[0].id as string,
     key: "",
     adding: false,
     saving: false,
-    baseURL: "",
+    verifying: false,
+    baseURL: modelProvider(MODEL_PROVIDERS[0].id).baseURL ?? "",
     api: "responses" as "responses" | "chat",
+    modelOpen: false,
+    modelID: "",
+    modelName: "",
+    customProviderID: "",
+    verify: undefined as { ok: boolean; message: string } | undefined,
   })
   const selectProvider = (id: string) => {
     const options = sync.data.config.provider?.[id]?.options
     setForm({
       provider: id,
       key: "",
-      baseURL: options?.baseURL ?? "",
+      baseURL: options?.baseURL ?? modelProvider(id).baseURL ?? "",
       api: options?.api === "chat" ? "chat" : "responses",
+      verify: undefined,
+      modelID: "",
+      modelName: "",
     })
   }
+  const modelID = () => form.modelID.trim()
+  const baseURL = () => form.baseURL.trim().replace(/\/+$/, "")
+  const customProviderID = () => {
+    const manual = form.customProviderID.trim().toLowerCase()
+    if (manual) return manual
+    // Derive a stable provider id from the endpoint host so a brand-new
+    // endpoint needs no extra naming step.
+    try {
+      const host = new URL(baseURL()).hostname.replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "")
+      return host ? `custom-${host}`.slice(0, 80) : ""
+    } catch {
+      return ""
+    }
+  }
+  const effectiveProvider = () => (form.provider === "custom" ? customProviderID() : form.provider)
+  const verify = async () => {
+    if (!baseURL() || form.verifying) return
+    setForm("verifying", true)
+    setForm("verify", undefined)
+    try {
+      const result = await settingsApi<{
+        ok: boolean
+        status?: number
+        modelFound?: boolean
+        models?: string[]
+        error?: string
+      }>(sdk.url, fetchFn, "/settings/custom-model/verify", {
+        method: "POST",
+        body: JSON.stringify({
+          baseURL: baseURL(),
+          ...(form.key.trim() ? { apiKey: form.key.trim() } : {}),
+          ...(modelID() ? { modelID: modelID() } : {}),
+        }),
+      })
+      if (result.ok) {
+        setForm("verify", {
+          ok: true,
+          message: modelID() ? `Connected · model "${modelID()}" is available` : "Connected · endpoint answered",
+        })
+      } else {
+        setForm("verify", {
+          ok: false,
+          message: result.error ?? `Connection failed${result.status ? ` (HTTP ${result.status})` : ""}`,
+        })
+      }
+    } catch (error) {
+      setForm("verify", { ok: false, message: reason(error) })
+    } finally {
+      setForm("verifying", false)
+    }
+  }
   const reason = (error: unknown) => (error instanceof Error ? error.message : String(error))
-  const connected = createMemo(() =>
-    providers
-      .connected()
-      .filter((item) => item.source !== "managed" && MODEL_PROVIDERS.some((provider) => provider.id === item.id)),
-  )
+  const connected = createMemo(() => providers.connected().filter((item) => item.source !== "managed"))
   const source = (item: { id: string; source?: ProviderSource }) => SOURCES[item.source ?? "api"]
   const refreshAfterSave = (
     failed: "settings.providerKeys.saved.reloadFailed" | "settings.providerKeys.removed.reloadFailed",
@@ -100,7 +160,10 @@ export function ProviderKeys(props: { onError?: (error: string | undefined) => v
   }
   const save = async () => {
     const value = form.key.trim()
-    if (!value || form.saving) return
+    if (form.saving) return
+    // A local or keyless OpenAI-compatible endpoint is valid as long as the
+    // model id and base URL are present.
+    if (!value && !(modelID() && baseURL())) return
     // An Ace key is a Wallet credential, not a provider key: say where it goes
     // instead of letting the server's refusal explain it.
     if (/^(?:osk_|thk_|thk-)/.test(value)) {
@@ -120,21 +183,57 @@ export function ProviderKeys(props: { onError?: (error: string | undefined) => v
         return
       }
     }
+    if (modelID() && !baseURL()) {
+      props.onError?.("Enter the model's API base URL before saving a custom model.")
+      return
+    }
+    if (modelID() && !/^[a-z0-9][a-z0-9-]*$/.test(effectiveProvider())) {
+      props.onError?.("Enter a provider id using lowercase letters, digits and dashes.")
+      return
+    }
     setForm("saving", true)
     props.onError?.(undefined)
     try {
-      await sdk.client.auth.connection({ providerID: form.provider, key: value, baseURL: form.baseURL, api: form.api })
+      if (modelID()) {
+        await settingsApi<boolean>(sdk.url, fetchFn, "/settings/custom-model", {
+          method: "POST",
+          body: JSON.stringify({
+            providerID: effectiveProvider(),
+            baseURL: baseURL(),
+            modelID: modelID(),
+            ...(form.modelName.trim() ? { modelName: form.modelName.trim() } : {}),
+            ...(value ? { apiKey: value } : {}),
+          }),
+        })
+      } else {
+        await sdk.client.auth.connection({
+          providerID: form.provider,
+          key: value,
+          baseURL: form.baseURL,
+          api: form.api,
+        })
+      }
       sync.set(
         "config",
         produce((config) => {
+          const id = modelID() ? effectiveProvider() : form.provider
           config.provider ??= {}
-          config.provider[form.provider] ??= {}
-          const provider = config.provider[form.provider]
+          config.provider[id] ??= {}
+          const provider = config.provider[id]
           provider.options ??= {}
           const base = form.baseURL.trim().replace(/\/+$/, "")
           if (base) provider.options.baseURL = base
           else delete provider.options.baseURL
-          if (form.provider === "openai") provider.options.api = form.api
+          if (id === "openai") provider.options.api = form.api
+          if (modelID()) {
+            provider.models ??= {}
+            provider.models[modelID()] = {
+              ...(provider.models[modelID()] ?? {}),
+              id: modelID(),
+              name: form.modelName.trim() || modelID(),
+              tool_call: true,
+            }
+          }
         }),
       )
       setForm("key", "")
@@ -238,6 +337,24 @@ export function ProviderKeys(props: { onError?: (error: string | undefined) => v
               />
             </div>
           </label>
+          <Show when={form.provider === "custom"}>
+            <label class="models-key-field">
+              <span class="text-12-medium text-text-weak">Provider ID</span>
+              <input
+                type="text"
+                autocomplete="off"
+                spellcheck={false}
+                disabled={form.saving}
+                value={form.customProviderID}
+                onInput={(event) => setForm("customProviderID", event.currentTarget.value)}
+                placeholder={customProviderID() || "my-endpoint"}
+                class="settings-field models-key-input"
+              />
+              <span class="text-12-regular text-text-weak">
+                Lowercase letters, digits and dashes. Leave blank to derive it from the base URL host.
+              </span>
+            </label>
+          </Show>
           <label class="models-key-field">
             <span class="text-12-medium text-text-weak">{language.t("provider.connect.method.apiKey")}</span>
             <input
@@ -267,6 +384,67 @@ export function ProviderKeys(props: { onError?: (error: string | undefined) => v
             />
             <span class="text-12-regular text-text-weak">{language.t("settings.providerKeys.baseURL.help")}</span>
           </label>
+          <label class="models-key-field">
+            <span class="text-12-medium text-text-weak">Model ID · optional</span>
+            <input
+              type="text"
+              autocomplete="off"
+              spellcheck={false}
+              disabled={form.saving}
+              value={form.modelID}
+              onInput={(event) => {
+                setForm("modelID", event.currentTarget.value)
+                setForm("verify", undefined)
+              }}
+              placeholder={
+                form.provider === "opencode-go" ? "deepseek-v4.1-flash" : "any model id your endpoint serves"
+              }
+              class="settings-field models-key-input"
+            />
+            <span class="text-12-regular text-text-weak">
+              Use this to add a model that is not in the built-in list. A custom provider id is required for a brand-new
+              endpoint; OpenCode Go models can be added directly.
+            </span>
+          </label>
+          <label class="models-key-field">
+            <span class="text-12-medium text-text-weak">Display name · optional</span>
+            <input
+              type="text"
+              autocomplete="off"
+              spellcheck={false}
+              disabled={form.saving}
+              value={form.modelName}
+              onInput={(event) => setForm("modelName", event.currentTarget.value)}
+              placeholder="Shown in the model picker"
+              class="settings-field models-key-input"
+            />
+          </label>
+          <div class="models-key-field">
+            <Button
+              class="settings-panel-action models-secondary-action"
+              type="button"
+              size="small"
+              variant="secondary"
+              disabled={form.verifying || !baseURL()}
+              onClick={() => void verify()}
+            >
+              {form.verifying ? "Testing…" : "Test connection"}
+            </Button>
+            <Show when={form.verify}>
+              {(result) => (
+                <span
+                  role="status"
+                  class="text-12-regular"
+                  classList={{ "text-text-strong": result().ok, "text-text-danger": !result().ok }}
+                >
+                  {result().message}
+                </span>
+              )}
+            </Show>
+            <span class="text-12-regular text-text-weak">
+              Sends one request to the base URL above. No key or prompt leaves for any other host.
+            </span>
+          </div>
           <Show
             when={form.provider === "openai"}
             fallback={
@@ -298,7 +476,11 @@ export function ProviderKeys(props: { onError?: (error: string | undefined) => v
             type="submit"
             size="small"
             variant="primary"
-            disabled={form.saving || !form.key.trim()}
+            disabled={
+              form.saving ||
+              (form.provider === "custom" && !modelID()) ||
+              (!form.key.trim() && !(modelID() && baseURL()))
+            }
           >
             {form.saving ? language.t("settings.saving") : language.t("settings.providerKeys.save")}
           </Button>

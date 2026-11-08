@@ -6,7 +6,7 @@ import { walletAmount } from "./session-usage"
 
 type Report = SessionReceiptsResponses[200]
 const reasons = {
-  signed_out: "Sign in to check Wallet settlement.",
+  signed_out: "Wallet settlement is unavailable in this local-first build.",
   unsupported: "This server does not support per-call receipts yet.",
   unauthorized: "Wallet receipts are unavailable for the current account or workspace.",
   server_unavailable: "The receipt server is unavailable. Please retry.",

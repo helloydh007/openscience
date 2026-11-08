@@ -1093,7 +1093,7 @@ export const ModelSettingsPopover: Component<{ trigger?: "label" | "icon" }> = (
                       <p class="model-settings-empty">
                         {query().trim()
                           ? `No models match “${query()}”.`
-                          : "No models are connected yet. Add a provider key, sign in, or connect a local model under Manage models."}
+                          : "No models are connected yet. Add a provider key or connect a local model under Manage models."}
                       </p>
                     </Show>
                     <Show when={catalogLimit() < catalog().length}>

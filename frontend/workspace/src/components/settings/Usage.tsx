@@ -265,8 +265,8 @@ export default function Usage(props: { services?: Services } = {}) {
                 when={available()?.connected !== false}
                 fallback={
                   <div class="usage-empty">
-                    Connect your Synthetic Sciences account in Ace to see managed usage. API-key and local activity are
-                    available without signing in.
+                    This local-first build has no hosted account. Provider-key and local usage are recorded on this
+                    device.
                   </div>
                 }
               >

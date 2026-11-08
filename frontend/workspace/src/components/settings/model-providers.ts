@@ -1,4 +1,20 @@
-export const MODEL_PROVIDERS = [
+export type ModelProviderPreset = {
+  id: string
+  atlas: string
+  label: string
+  placeholder: string
+  /** Documented base URL used to prefill the field; the user may change it. */
+  baseURL?: string
+}
+
+export const MODEL_PROVIDERS: readonly ModelProviderPreset[] = [
+  {
+    id: "opencode-go",
+    atlas: "opencode",
+    label: "OpenCode Go",
+    placeholder: "OPENCODE_API_KEY",
+    baseURL: "https://opencode.ai/zen/go/v1",
+  },
   { id: "anthropic", atlas: "anthropic", label: "Anthropic", placeholder: "sk-ant-…" },
   { id: "openai", atlas: "openai", label: "OpenAI", placeholder: "sk-…" },
   { id: "google", atlas: "gemini", label: "Google Gemini", placeholder: "AIza…" },
@@ -14,12 +30,13 @@ export const MODEL_PROVIDERS = [
   { id: "zai", atlas: "zai", label: "Z.AI (GLM)", placeholder: "…" },
   { id: "cerebras", atlas: "cerebras", label: "Cerebras", placeholder: "csk-…" },
   { id: "perplexity", atlas: "perplexity", label: "Perplexity", placeholder: "pplx-…" },
-] as const
+  { id: "custom", atlas: "custom", label: "Custom OpenAI-compatible", placeholder: "your API key (optional)" },
+]
 
 export const MODEL_PROVIDER_LABELS = Object.fromEntries(
   MODEL_PROVIDERS.map((provider) => [provider.id, provider.label]),
 ) as Record<string, string>
 
-export function modelProvider(id: string) {
+export function modelProvider(id: string): ModelProviderPreset {
   return MODEL_PROVIDERS.find((provider) => provider.id === id) ?? MODEL_PROVIDERS[0]
 }

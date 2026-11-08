@@ -255,7 +255,7 @@ export const CredentialServices: Component<{
                     </div>
                     <Show when={service.connected}>
                       <span class="settings-row-status">
-                        {service.source === "account" ? "Synced from your workspace" : "Saved on this device"}
+                        Saved on this device
                         {service.set_fields.length > 1 ? ` · ${service.set_fields.length} fields` : ""}
                       </span>
                     </Show>
@@ -281,29 +281,8 @@ export const CredentialServices: Component<{
                           Remove
                         </Button>
                       </Show>
-                      <Show when={service.source === "account"}>
-                        <Button
-                          size="small"
-                          variant="secondary"
-                          onClick={() =>
-                            platform.openLink(
-                              service.organization_id
-                                ? `https://app.syntheticsciences.ai/workspace/${encodeURIComponent(service.organization_id)}/credentials`
-                                : "https://app.syntheticsciences.ai/integrations",
-                            )
-                          }
-                        >
-                          Manage
-                        </Button>
-                      </Show>
                       <Button size="small" variant="secondary" disabled={saving()} onClick={() => open(service.id)}>
-                        {editing() === service.id
-                          ? "Cancel"
-                          : service.source === "account"
-                            ? "Use local key"
-                            : service.connected
-                              ? "Update"
-                              : "Add credential"}
+                        {editing() === service.id ? "Cancel" : service.connected ? "Update" : "Add credential"}
                       </Button>
                     </div>
                   </div>

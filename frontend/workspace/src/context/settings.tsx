@@ -46,7 +46,9 @@ const defaultSettings: Settings = {
     releaseNotes: true,
   },
   updates: {
-    startup: true,
+    // Local-first fork: do not check the upstream release feed on startup.
+    // Manual checks remain available in Settings → General.
+    startup: false,
   },
   appearance: {
     fontSize: 14,

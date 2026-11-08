@@ -67,7 +67,6 @@ type Option = {
 }
 
 type Scope = "all" | "reasoning" | "latest" | "long"
-type BillingPreference = { llm: "managed" | "byok" | null }
 type OptionGroup<T> = { id: string; label: string; models: T[] }
 type WorkerOption = {
   value: string
@@ -113,11 +112,6 @@ export default function Models() {
   const [preferences, preferenceActions] = steady(
     createResource(() => settingsApi<CapabilityPreferences>(sdk.url, fetchFn, "/settings/preferences")),
   )
-  const [billing, billingActions] = steady(
-    createResource(() => settingsApi<BillingPreference>(sdk.url, fetchFn, "/settings/billing")),
-  )
-  const unsubscribeBilling = sync.onProvidersRefreshed(() => void billingActions.refetch())
-  onCleanup(unsubscribeBilling)
   const routeOption = (item: AvailableModel): RouteOption => {
     const display = displayProviderForModel(item.provider, item.id)
     const key = { providerID: item.provider.id, modelID: item.id }
@@ -219,7 +213,7 @@ export default function Models() {
   const visibleCount = createMemo(() => options().filter((model) => model.visible).length)
   const workerOptions = createMemo<WorkerOption[]>(() => {
     const selected = preferences()?.delegation_worker_model ?? undefined
-    const currentBilling = billing.latest?.llm ?? sync.data.config.billing?.llm
+    const currentBilling = sync.data.config.billing?.llm ?? "byok"
     const routes = options()
       .filter(
         (model) =>

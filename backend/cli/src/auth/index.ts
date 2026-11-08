@@ -113,7 +113,7 @@ export namespace Auth {
   export async function set(key: string, info: Info) {
     if (info.type === "api" && isAtlasApiKey(info.key)) {
       throw new Error(
-        "Ace workspace credentials belong to OpenScience sign-in, not provider keys. Sign in to Ace or add a provider key you control.",
+        "That credential belongs to a removed hosted account. Add a provider key you control in Customize → Models.",
       )
     }
     const selectsByok = key === "openrouter" && info.type === "api" && !isAtlasApiKey(info.key)
@@ -192,7 +192,7 @@ export namespace Auth {
     await CredentialLifecycle.mutate(`provider-auth.remove:${key}`, async () => {
       const local = await JsonStore.read(filepath)
       if (!local[key] && (await WorkspaceCredentials.read())?.auth[key]) {
-        throw new Error("Manage this synced provider key in your workspace on app.syntheticsciences.ai.")
+        throw new Error("This provider key is managed outside this local build.")
       }
       await JsonStore.update(filepath, (data) => {
         delete data[key]

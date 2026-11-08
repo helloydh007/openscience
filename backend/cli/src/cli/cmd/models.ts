@@ -8,6 +8,7 @@ import { UI } from "../ui"
 import { EOL } from "os"
 
 const PROVIDER_LABELS: Record<string, string> = {
+  "opencode-go": "OpenCode Go",
   anthropic: "Anthropic",
   openai: "OpenAI",
   "openai-codex": "OpenAI (Codex subscription)",

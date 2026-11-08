@@ -28,8 +28,6 @@ import { EOL } from "os"
 import { WebCommand } from "./cli/cmd/web"
 import { PrCommand } from "./cli/cmd/pr"
 import { SessionCommand } from "./cli/cmd/session"
-import { DevicesCommand, LoginCommand, LogoutCommand, StatusCommand, SyncCommand } from "./cli/cmd/connect"
-import { WalletCommand } from "./cli/cmd/billing"
 import { KeysCommand, ConnectCommand, DisconnectCommand } from "./cli/cmd/auth"
 import { LocalCommand } from "./cli/cmd/local"
 import { SandboxCommand } from "./cli/cmd/sandbox"
@@ -46,7 +44,6 @@ import { purgeRetiredAtlasAgentInstall } from "./skill/retired-install"
 import { SELF_RESTART_ARG, SelfRestart } from "./process/self-restart"
 import { DARWIN_UPDATE_SWAP_ARG, DarwinUpdateSwap } from "./process/darwin-update-swap"
 import { GracefulShutdown } from "./process/graceful-shutdown"
-import { UsageLogging } from "./session/usage-logging"
 
 if (process.argv[2] === DARWIN_UPDATE_SWAP_ARG) {
   try {
@@ -159,9 +156,8 @@ const cli = yargs(hideBin(process.argv))
       // process env so skills/tools/connectors actually use them. Dynamic import
       // keeps the credential route module out of every command's static graph.
       if (!capabilityCanary) {
-        UsageLogging.start()
         await import("./server/routes/settings/credentials").then((m) => m.applyCredentialEnv()).catch(() => {})
-        void import("./openscience").then((m) => m.OpenScience.startCredentialSync())
+        // Local-first build: no account credential sync and no session-trace upload.
       }
 
       // First authenticated startup quietly provisions the app-owned Python
@@ -208,13 +204,7 @@ const cli = yargs(hideBin(process.argv))
   .command(PrCommand)
   .command(SessionCommand)
   .command(InitCommand)
-  .command(LoginCommand)
-  .command(SyncCommand)
-  .command(LogoutCommand)
-  .command(StatusCommand)
-  .command(DevicesCommand)
   .command(KeysCommand)
-  .command(WalletCommand)
   .command(DoctorCommand)
   .command(ConnectCommand)
   .command(DisconnectCommand)
@@ -278,7 +268,6 @@ async function run() {
     // run using `docker run --init`.
     // Explicitly exit to avoid any hanging subprocesses.
     await GracefulShutdown.final({ timeoutMs: 8_000 }).catch(() => undefined)
-    await UsageLogging.drain().catch(() => undefined)
     await disposeDataRootOperation().catch(() => undefined)
     await Log.flush().catch(() => undefined)
     process.exit()

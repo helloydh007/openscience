@@ -220,6 +220,9 @@ export function logicalModelKey(providerID: string, modelID: string): string {
 }
 
 export const isFrontier = (model: ModelKey) =>
+  // OpenCode Go is a first-class curated route in this build: show every model
+  // its catalog exposes instead of hiding them behind Manage Models.
+  model.providerID === "opencode-go" ||
   FRONTIER_MODELS.has(canonicalKey(model.providerID, model.modelID)) ||
   FRONTIER_MODELS.has(logicalModelKey(model.providerID, model.modelID))
 

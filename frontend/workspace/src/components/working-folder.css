@@ -135,3 +135,19 @@
     transition: none;
   }
 }
+
+/* Permission mode chip in the composer footer. Full access is a deliberate,
+   visible state: its summary and the menu option carry the warning colour. */
+.permission-chip[data-permission-mode="full"] > summary {
+  color: var(--color-text-warning, var(--text-warning-base));
+}
+
+.permission-chip[data-permission-mode="full"] > summary:hover,
+.permission-chip[data-permission-mode="full"] > summary:focus-visible,
+.permission-chip[data-permission-mode="full"][open] > summary {
+  color: var(--color-text-warning, var(--text-warning-base));
+}
+
+.permission-chip .working-folder__option[data-tone="warning"] strong {
+  color: var(--color-text-warning, var(--text-warning-base));
+}

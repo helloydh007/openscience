@@ -13,7 +13,6 @@ import { FolderResolveRoutes } from "./routes/folder-resolve"
 import { RepoRoutes } from "./routes/repo"
 import z from "zod"
 import { Provider } from "../provider/provider"
-import { KeyCheck } from "../provider/key-check"
 import { NamedError } from "@synsci/util/error"
 import { LSP } from "../lsp"
 import { Format } from "../format"
@@ -56,7 +55,6 @@ import { CredentialsRoutes } from "./routes/settings/credentials"
 import { StorageRoutes } from "./routes/settings/storage"
 import { ComputeSettingsRoutes } from "./routes/settings/compute"
 import { SettingsPreferencesRoutes } from "./routes/settings/preferences"
-import { UsageLoggingRoutes } from "./routes/settings/usage-logging"
 import { UsageSettingsRoutes } from "./routes/settings/usage"
 import { LocalModelsRoutes } from "./routes/settings/local"
 import { SandboxSettingsRoutes } from "./routes/settings/sandbox"
@@ -67,12 +65,9 @@ import { projectSelection } from "./project-selection"
 import { CredentialLifecycle } from "../credentials/lifecycle"
 import { CredentialTeardown } from "../credentials/teardown"
 import { DataRootBarrier } from "../global/data-root-barrier"
-import { OnboardingAuthRoutes } from "./routes/onboarding-auth"
 import { SearchSettingsRoutes } from "./routes/settings/search"
+import { CustomModelRoutes } from "./routes/settings/custom-model"
 import { ProviderConnectionRoutes } from "./routes/provider-connection"
-import { AccountRoutes } from "./routes/account"
-import { BillingSettingsRoutes } from "./routes/settings/billing"
-import { WalletSettingsRoutes } from "./routes/settings/wallet"
 import { Startup } from "../util/startup"
 
 // @ts-ignore This global is needed to prevent ai-sdk from logging warnings to stdout https://github.com/vercel/ai/blob/2dc67e0ef538307f21368db32d5a12345d98831b/packages/ai/src/logger/log-warnings.ts#L85
@@ -275,46 +270,23 @@ export namespace Server {
           await DataRootBarrier.during(Global.Path.data, next, 120_000)
         })
         .route("/global", GlobalRoutes())
-        .route("/account", AccountRoutes())
         // Settings panels backed by global (project-independent) stores, so
         // mounted before the Instance.provide wrapper below (no directory).
         .route("/settings/credentials", CredentialsRoutes())
         .route("/settings/storage", StorageRoutes())
         .route("/settings/compute", ComputeSettingsRoutes())
         .route("/settings/preferences", SettingsPreferencesRoutes())
-        .route("/settings/usage-logging", UsageLoggingRoutes())
         .route("/settings/usage", UsageSettingsRoutes())
         .route("/settings/local", LocalModelsRoutes())
         .route("/settings/sandbox", SandboxSettingsRoutes())
         .route("/settings/updates", UpdatesSettingsRoutes())
         .route("/settings/cli", CliSettingsRoutes())
         .route("/settings/scientific-tools", ScientificToolsSettingsRoutes())
-        .route("/settings/billing", BillingSettingsRoutes())
-        .route("/settings/wallet", WalletSettingsRoutes())
         .route("/settings/search", SearchSettingsRoutes())
+        .route("/settings/custom-model", CustomModelRoutes())
         .route(
           "/auth",
           ProviderConnectionRoutes(() => Provider.invalidate()),
-        )
-        .route(
-          "/auth",
-          OnboardingAuthRoutes({
-            readCredential: (providerID) => Auth.get(providerID),
-            saveCredential: (providerID, auth) => Auth.set(providerID, auth),
-            removeCredential: (providerID) => Auth.remove(providerID),
-            verifyKey: (providerID, key) => KeyCheck.verify({ providerID, key, config: () => Config.getGlobal() }),
-            readBillingMode: async () => (await Config.getGlobal()).billing?.llm ?? null,
-            selectByok: async () => {
-              await Config.updateGlobal({ billing: { llm: "byok" } }, { preserveInstances: true })
-            },
-            restoreBillingMode: async (mode) => {
-              await Config.updateGlobal({ billing: { llm: mode } }, { preserveInstances: true })
-            },
-            // Defer this call because Provider imports Server for local fetches;
-            // the route module itself intentionally has no Provider dependency.
-            invalidate: () => Provider.invalidate(),
-            serialize: (action) => CredentialLifecycle.serialized(action),
-          }),
         )
         .put(
           "/auth/:providerID",

@@ -94,9 +94,9 @@ export const dict = {
   "settings.search.refresh": "刷新状态",
   "settings.search.loading": "正在检查搜索配置…",
   "settings.search.error": "无法读取搜索状态，请刷新重试。",
-  "settings.search.configured": "research_search：已配置 Firecrawl 或 Ace。请运行一次搜索，确认访问权限和可用额度。",
+  "settings.search.configured": "research_search：已配置 Firecrawl。请运行一次搜索，确认访问权限和可用额度。",
   "settings.search.missing":
-    "research_search：尚未配置 Firecrawl 或 Ace 凭证。请在“自定义 → 凭证”中添加 Firecrawl 密钥，或在“钱包”中连接 Ace。",
+    "research_search：尚未配置 Firecrawl 密钥。请在“自定义 → 凭证”中添加你自己的 Firecrawl 密钥。",
   "settings.search.builtin":
     "内置工具：literature 查找论文，webfetch 读取指定网址，science_search / science_fetch 查询科学数据库。这些工具不依赖模型提供商的搜索附加服务，但仍需满足数据源凭证和网络权限要求。",
   "settings.search.mcp":

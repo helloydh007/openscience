@@ -534,27 +534,10 @@ export namespace OpenScience {
   }
 
   export async function getSession(): Promise<OpenScienceSession | null> {
-    if (!existsSync(SESSION_PATH)) return null
-    try {
-      const data = (await Bun.file(SESSION_PATH).json()) as Partial<OpenScienceSession>
-      if (!isAccountKey(data.api_key)) return null
-      const persistedOrganizationID = loginOrganizationID(data.organization_id)
-      const scope = await readWorkspaceScope(data.api_key)
-      if (scope === null) throw new FundingContextError("The saved workspace scope is invalid. Sign in again.")
-      const organizationID = scope ? scope.organization_id : persistedOrganizationID
-      const locked = scope?.workspace_locked === true || data.workspace_locked === true
-      return {
-        api_key: data.api_key,
-        user_id: typeof data.user_id === "string" ? data.user_id : "",
-        device_name: typeof data.device_name === "string" ? data.device_name : undefined,
-        ...(organizationID ? { organization_id: organizationID } : {}),
-        ...(locked ? { workspace_locked: true } : {}),
-        ...(data.origin === "key" || data.origin === "browser" ? { origin: data.origin } : {}),
-      }
-    } catch (error) {
-      log.warn("could not read account session", { error: error instanceof Error ? error.message : String(error) })
-      return null
-    }
+    // Local-first build: account sign-in was removed, and any session file left
+    // by an earlier upstream install is deliberately ignored. Every managed
+    // route, credential sync, wallet read and trace gate therefore stays off.
+    return null
   }
 
   export async function saveSession(session: OpenScienceSession): Promise<void> {
@@ -2008,11 +1991,10 @@ export namespace OpenScience {
     const configured = (await config.getGlobal()).billing?.llm
     if (configured === "managed") return "managed"
     if (configured === "byok") return "byok"
-    const openrouterAuth = await Auth.get("openrouter").catch(() => undefined)
-    const storedOwnKey = openrouterAuth?.type === "api" && !isAtlasManagedKey(openrouterAuth.key)
-    const envOpenRouterKey = process.env.OPENROUTER_API_KEY
-    const envOwnKey = !!envOpenRouterKey && !isAtlasManagedKey(envOpenRouterKey)
-    return storedOwnKey || envOwnKey ? "byok" : "managed"
+    // Local-first build: with no account there is no managed route to fall back
+    // to, so an unconfigured installation is BYOK and asks for a key instead of
+    // silently deleting the user's provider list.
+    return "byok"
   }
 
   /** The entitlement check, shared by every concurrent caller in one context. */

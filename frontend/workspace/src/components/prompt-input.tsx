@@ -58,6 +58,7 @@ import { projectHref, projectPathname } from "@/utils/project-route"
 import { createMediaQuery } from "@solid-primitives/media"
 import { ModelSettingsPopover } from "./model-settings-popover"
 import { ComposerTools } from "./composer-tools"
+import { composerOverlays, registerOverlayDetails } from "./overlay-group"
 import {
   loadedSkillNamesThisTurn,
   recordRecentSkill,
@@ -3227,6 +3228,61 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
                   pending={pendingWorkingRoot()}
                   onPending={setPendingWorkingRoot}
                 />
+                <Show when={sdk.projectID && !researchAccess.error}>
+                  <details
+                    ref={(element) => registerOverlayDetails(composerOverlays, "access", element)}
+                    class="working-folder permission-chip"
+                    data-permission-mode={selectedResearchAccess()}
+                  >
+                    <summary
+                      aria-label={`Action approval: ${researchAccessLabel()}`}
+                      aria-disabled={researchAccess.loading || researchAccessSaving() ? "true" : undefined}
+                    >
+                      <Icon name="shield" size="small" />
+                      <span class="working-folder__label">
+                        {researchAccessSaving() ? "Saving…" : researchAccessLabel()}
+                      </span>
+                      <Icon name="chevron-down" size="small" />
+                    </summary>
+                    <div class="working-folder__menu" role="radiogroup" aria-label="Action approval">
+                      <p class="working-folder__hint">
+                        Controls whether the agent asks before running tools. The choice is saved for this project.
+                      </p>
+                      <For each={RESEARCH_ACCESS_OPTIONS}>
+                        {(option) => (
+                          <button
+                            type="button"
+                            class="working-folder__option"
+                            role="radio"
+                            aria-checked={selectedResearchAccess() === option.value}
+                            data-tone={option.value === "full" ? "warning" : undefined}
+                            disabled={researchAccess.loading || researchAccessSaving()}
+                            onClick={(event) => {
+                              const details = event.currentTarget.closest("details")
+                              void applyResearchAccess(option.value, event.currentTarget).then(() => {
+                                details?.removeAttribute("open")
+                              })
+                            }}
+                          >
+                            <span class="working-folder__option-copy">
+                              <strong>{option.label}</strong>
+                              <small>{option.description}</small>
+                            </span>
+                            <Show when={selectedResearchAccess() === option.value}>
+                              <Icon name="check" size="small" />
+                            </Show>
+                          </button>
+                        )}
+                      </For>
+                      <Show when={selectedResearchAccess() === "full"}>
+                        <p role="alert" class="working-folder__error">
+                          Full access runs tools, shell commands and file edits without asking. Only enable it for
+                          projects you trust.
+                        </p>
+                      </Show>
+                    </div>
+                  </details>
+                </Show>
                 <Show when={store.intent}>
                   {(intent) => (
                     <Tooltip placement="top" value={`Exit ${intent()} mode`}>

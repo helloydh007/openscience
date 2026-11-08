@@ -823,7 +823,7 @@ export const CredentialsRoutes = lazy(() =>
         const id = c.req.valid("param").id
         const spec = specFor(id)
         if ((await readStore())[id]?.source === "account") {
-          return c.json({ error: "Manage this synced credential in your workspace on app.syntheticsciences.ai." }, 409)
+          return c.json({ error: "This credential is managed outside this local build." }, 409)
         }
         const tombstoned = await mutateCredentialStore(id, `settings-credential.remove:${id}:tombstone`, () =>
           updateStore((current) => {

@@ -3425,7 +3425,7 @@ export namespace Provider {
   }
 
   export const NO_PROVIDER_HINT =
-    "No model providers are available. Sign in to Ace, add your own API key, or connect a local/subscription model in Customize → Models."
+    "No model providers are available. Add your own API key in Customize → Models, or connect a local/subscription model."
 
   const priority = ["claude-sonnet-5", "claude-sonnet-4", "claude-opus-4", "gpt-5", "gemini-3.1-pro", "gemini-3-pro"]
 

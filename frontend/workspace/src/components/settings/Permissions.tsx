@@ -19,7 +19,6 @@ import { useGlobalSync } from "@/context/global-sync"
 import { resolveProjectRoute } from "@/utils/project-route"
 import { PermissionToolDefaults } from "../settings-permissions"
 import { PanelBody, PanelHeader, PanelScroll, Section, steady } from "./_shared"
-import { UsageLogging } from "./UsageLogging"
 import { useSettingsNav } from "./nav"
 import "./preference-panels.css"
 
@@ -444,7 +443,6 @@ const Permissions: Component = () => {
               </button>
             </div>
           </div>
-          <UsageLogging />
         </PanelBody>
       </div>
     </PanelScroll>
