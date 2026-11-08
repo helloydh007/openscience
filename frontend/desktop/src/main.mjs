@@ -31,6 +31,19 @@ import { readAppearance, resolveAppearance, saveAppearance, splashQuery, sweepAp
 
 import { workspaceOrigin, workspaceHealth, workspaceNavigation } from "./remote-workspace.mjs"
 
+// Native Wayland on Linux: prefer the Ozone Wayland backend when the session
+// provides one, keep client-side decorations, and enable fractional scaling
+// and the Wayland IME. `ozone-platform-hint=auto` still falls back to X11 (and
+// XWayland) when no Wayland display is present, so an X11 session keeps its
+// existing behaviour. These switches must be set before the app is ready.
+if (process.platform === "linux") {
+  app.commandLine.appendSwitch(
+    "enable-features",
+    "UseOzonePlatform,WaylandWindowDecorations,WaylandFractionalScaleV1,EnableWaylandIme",
+  )
+  app.commandLine.appendSwitch("ozone-platform-hint", "auto")
+}
+
 const execute = promisify(execFile)
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..")
 const splashPage = fileURLToPath(new URL("./splash/splash.html", import.meta.url))

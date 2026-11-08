@@ -1,0 +1,6 @@
+[499671:1109/000907.308338:WARNING:ui/ozone/platform/wayland/common/wayland_object.cc:119] Binding to zwp_pointer_gestures_v1 version 1 but version 3 is available.
+[499671:1109/000907.309928:WARNING:ui/ozone/platform/wayland/common/wayland_object.cc:119] Binding to org_kde_kwin_appmenu_manager version 1 but version 2 is available.
+DevTools listening on ws://127.0.0.1:9225/devtools/browser/dd634b3d-e025-4c3a-9cbb-5dfce1067a1e
+[499671:1109/000907.988962:WARNING:ui/ozone/platform/wayland/host/wayland_surface.cc:170] Server doesn't support zcr_alpha_compositing_v1.
+[499671:1109/000907.988995:WARNING:ui/ozone/platform/wayland/host/wayland_surface.cc:185] Server doesn't support overlay_prioritizer.
+[499671:1109/000929.120062:WARNING:ui/ozone/platform/wayland/host/zwp_idle_inhibit_manager.cc:65] Cannot inhibit going idle when no window is focused

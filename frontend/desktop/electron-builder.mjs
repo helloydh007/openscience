@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs"
+import { readdirSync, readFileSync, rmSync } from "node:fs"
 import path from "node:path"
 import { windowsSigning } from "./windows-signing.mjs"
 
@@ -12,6 +12,18 @@ const version =
 
 const name = process.platform === "darwin" ? "mac" : process.platform === "win32" ? "windows" : "linux"
 const signed = process.env.OPENSCIENCE_DESKTOP_SIGNED === "true"
+
+/**
+ * Never ship a host Wayland client library. Electron resolves Wayland through
+ * the desktop's own loader and Mesa stack; bundling one from the build host is
+ * the classic AppImage cause of "failed to create display" on another distro.
+ */
+function stripBundledWayland(context) {
+  for (const entry of readdirSync(context.appOutDir)) {
+    if (!entry.startsWith("libwayland")) continue
+    rmSync(path.join(context.appOutDir, entry), { recursive: true, force: true })
+  }
+}
 
 export default {
   appId: "ai.syntheticsciences.openscience",
@@ -28,6 +40,7 @@ export default {
     },
   ],
   asar: true,
+  afterPack: stripBundledWayland,
   mac: {
     // Keep the CLI/process executable lowercase on every platform, but brand
     // the macOS bundle exactly as the updater's immutable staging contract.
@@ -69,5 +82,15 @@ export default {
       : { forceCodeSigning: false, signExecutable: false }),
   },
   nsis: { oneClick: false, allowToChangeInstallationDirectory: true },
-  linux: { target: ["AppImage"], category: "Science;Development", icon: "build/icon.png" },
+  linux: {
+    target: ["AppImage"],
+    category: "Science;Development",
+    icon: "build/icon.png",
+    // The main process also sets these before `ready`; repeating them in the
+    // desktop entry keeps a launcher that bypasses AppRun on the Wayland path.
+    executableArgs: [
+      "--enable-features=UseOzonePlatform,WaylandWindowDecorations,WaylandFractionalScaleV1,EnableWaylandIme",
+      "--ozone-platform-hint=auto",
+    ],
+  },
 }

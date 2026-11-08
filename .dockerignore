@@ -1,0 +1,9 @@
+.git
+node_modules
+**/node_modules
+**/dist
+.turbo
+.build
+dist
+frontend/docs/node_modules
+frontend/landing/node_modules
