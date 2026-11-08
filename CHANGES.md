@@ -3,7 +3,10 @@
 本仓库是 [`synthetic-sciences/OpenScience`](https://github.com/synthetic-sciences/OpenScience) 的 fork：
 
 - Fork 地址：<https://github.com/helloydh007/openscience>
-- 上游基线：`main` @ `2026-11-08`（导入提交 `chore: baseline import of upstream OpenScience main`）
+- 上游基线：`a08e0ad release: v2.0.153`（分支历史完整保留，改动为两个快进提交）
+- 本次提交：
+  - `66d63f0 feat: local-first OpenScience (privacy, BYOK models, permissions)`
+  - `ad2cd29 build: reproducible Ubuntu 22.04 Wayland AppImage`
 - 目标：移除隐藏上传与账号体系，完善 BYOK 模型配置，增加会话级权限按钮，并产出 Wayland 原生可用的 AppImage。
 
 ## 打包形态选型
