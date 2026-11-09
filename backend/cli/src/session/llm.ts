@@ -401,6 +401,11 @@ export namespace LLM {
                 "User-Agent": `openscience/${Installation.VERSION}`,
               }
             : undefined),
+        // OpenCode Go routes each conversation to a backend by this stable
+        // per-session id; without it the gateway answers HTTP 400 ("missing
+        // x-opencode-session"). The OpenScience session id already uses the
+        // documented `ses_…` shape.
+        ...(input.model.providerID === "opencode-go" ? { "x-opencode-session": input.sessionID } : {}),
         ...input.model.headers,
         ...tier.headers,
         ...headers,

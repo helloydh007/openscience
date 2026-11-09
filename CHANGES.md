@@ -314,10 +314,47 @@ openscience --enable-logging=stderr
 
 - 构建：`./docker/build.sh`（Ubuntu 22.04 / glibc 2.35）
 - 产物：`dist/OpenScience-linux-x64.AppImage`（186 MB）
-- SHA-256：`5ed4271e70e5b49ac0acab8857a1e74e7f61424fc3a6e5de648306d931863619`
-  （见 `docs/local-first/appimage.sha256`）
+- SHA-256：`e0301247b93e725797ccedbb4dec4b71a96ab8ef36a6aeb859d18c9746801dd2`
+  （见 `docs/local-first/appimage.sha256`；此版本含 OpenCode Go 会话头修复）
 - sidecar 的 ELF 最高只引用到 `GLIBC_2.17`，可在老发行版加载；Electron 自身按 v44 的系统要求运行
 - desktop Exec 带 `--enable-features=UseOzonePlatform,WaylandWindowDecorations,... --ozone-platform-hint=auto`
 - `afterPack` 后包内无 `libwayland*`（使用系统库）
 - 最终包在 KDE Plasma Wayland 中启动、sidecar health 正常、页面无登录：
   `docs/local-first/projects-final-wayland.png`、`wayland-final.log`
+
+## 修复：OpenCode Go 返回 400 MissingSessionID
+
+**现象**：调用 OpenCode Go 模型返回
+`Request is missing x-opencode-session and cannot be routed efficiently` / HTTP 400。
+
+**原因**：OpenCode Go 要求每个对话请求带稳定的 `x-opencode-session: ses_…`（用于路由与 prompt cache），OpenScience 只发送了 `User-Agent`。
+
+**修改**：
+
+- `backend/cli/src/session/llm.ts`：对 `opencode-go` 的每次 `streamText` 注入
+  `"x-opencode-session": input.sessionID`。OpenScience 的会话 ID 本身就是 `ses_…`，
+  且在整个对话（含重试）中稳定。
+- `backend/cli/src/server/routes/settings/custom-model.ts`：Test connection 对带 key 的
+  请求先执行一次 `max_tokens: 1` 的 chat completion 探测；`GET /models` 在 OpenCode
+  是公开的，不能用来判断 key 是否有效。未填写 Model ID 的 OpenCode Go 取模型列表
+  第一项探测。
+- `frontend/workspace/src/components/settings/ProviderKeys.tsx`：验证请求带上 provider id。
+
+**复测**：
+
+```text
+POST /zen/go/v1/chat/completions（无 session 头，假 key）→ 400 MissingSessionID
+POST /zen/go/v1/chat/completions（x-opencode-session: ses_test123，假 key）→ 401 Invalid credential
+```
+
+即网关已接受会话头，剩余错误只与真实 API key 有关。
+
+最终 AppImage 的端到端复测（OpenCode Go provider 指向本地 SSE mock）：
+
+```text
+POST /v1/chat/completions
+x-opencode-session: ses_e42178ffcffeHxNgiApvXNU8tE   ← 与实际会话 ID 一致
+user-agent: openscience/2.0.153-local.1 ai-sdk/provider-utils/... runtime/bun/1.3.14
+authorization: Bearer test-key
+→ 对话正常完成（finish: stop）
+```

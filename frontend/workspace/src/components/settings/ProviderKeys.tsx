@@ -128,6 +128,7 @@ export function ProviderKeys(props: { onError?: (error: string | undefined) => v
       }>(sdk.url, fetchFn, "/settings/custom-model/verify", {
         method: "POST",
         body: JSON.stringify({
+          providerID: effectiveProvider(),
           baseURL: baseURL(),
           ...(form.key.trim() ? { apiKey: form.key.trim() } : {}),
           ...(modelID() ? { modelID: modelID() } : {}),
@@ -136,7 +137,11 @@ export function ProviderKeys(props: { onError?: (error: string | undefined) => v
       if (result.ok) {
         setForm("verify", {
           ok: true,
-          message: modelID() ? `Connected · model "${modelID()}" is available` : "Connected · endpoint answered",
+          message: modelID()
+            ? `Connected · model "${modelID()}" is available`
+            : form.key.trim()
+              ? "Connected · key accepted"
+              : "Connected · endpoint answered",
         })
       } else {
         setForm("verify", {

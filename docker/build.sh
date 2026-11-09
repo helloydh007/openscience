@@ -13,6 +13,8 @@ docker run --rm \
   -e HOST_GID="$(id -g)" \
   -v "$PWD/dist:/out" \
   openscience-appimage:local \
-  bash -lc 'bash docker/build-appimage.sh && cp /work/frontend/desktop/dist/OpenScience-linux-*.AppImage /out/OpenScience-linux-x64.AppImage && chown "$HOST_UID:$HOST_GID" /out/OpenScience-linux-x64.AppImage'
+  bash -lc 'bash docker/build-appimage.sh && cp /work/frontend/desktop/dist/OpenScience-linux-*.AppImage /out/OpenScience-linux-x64.AppImage.new && chown "$HOST_UID:$HOST_GID" /out/OpenScience-linux-x64.AppImage.new && mv -f /out/OpenScience-linux-x64.AppImage.new /out/OpenScience-linux-x64.AppImage'
 
+sha256sum dist/OpenScience-linux-x64.AppImage > dist/OpenScience-linux-x64.AppImage.sha256
 ls -lh dist/OpenScience-linux-x64.AppImage
+cat dist/OpenScience-linux-x64.AppImage.sha256

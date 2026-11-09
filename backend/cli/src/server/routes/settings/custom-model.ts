@@ -40,6 +40,10 @@ const BaseURL = z
   }, "Enter an HTTP(S) API base URL without credentials, query, fragment, or a request endpoint.")
 
 const Verify = z.object({
+  /** Optional provider id. OpenCode Go uses it to pick a probe model when the
+   * form has no model id, so Test connection validates the key instead of the
+   * provider's public model list. */
+  providerID: z.string().trim().min(1).max(80).optional(),
   baseURL: BaseURL,
   apiKey: z.string().trim().min(1).optional(),
   modelID: z.string().trim().min(1).max(200).optional(),
@@ -95,22 +99,72 @@ async function summary(response: Response): Promise<string> {
 async function verify(input: z.infer<typeof Verify>): Promise<z.infer<typeof Result>> {
   const base = normalize(input.baseURL)
   const auth = headers(input.apiKey)
+
   const list = await fetch(`${base}/models`, {
     headers: auth,
     redirect: "error",
     signal: AbortSignal.timeout(10_000),
   }).catch(() => undefined)
+  if (list && (list.status === 401 || list.status === 403)) {
+    const detail = await summary(list)
+    return { ok: false, status: list.status, error: `Authentication was rejected${detail ? `: ${detail}` : "."}` }
+  }
+  const ids = list?.ok ? modelIDs(await list.json().catch(() => undefined)) : []
+
+  // A completion is the only honest check of a key: several providers serve
+  // GET /models publicly, so a 200 there proves connectivity but not auth.
+  // Probe with the requested model, or with the first listed model for an
+  // OpenCode Go key when the form has no model id.
+  const probeModel =
+    input.modelID ?? (list?.ok && input.apiKey && input.providerID === "opencode-go" ? ids[0] : undefined)
+  if (probeModel) {
+    const chat = await fetch(`${base}/chat/completions`, {
+      method: "POST",
+      headers: { ...auth, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: probeModel,
+        messages: [{ role: "user", content: "ping" }],
+        max_tokens: 1,
+        stream: false,
+      }),
+      redirect: "error",
+      signal: AbortSignal.timeout(20_000),
+    }).catch(() => undefined)
+    if (chat?.ok) {
+      return {
+        ok: true,
+        status: chat.status,
+        modelFound: true,
+        ...(ids.length ? { models: ids.slice(0, 200) } : {}),
+      }
+    }
+    if (chat) {
+      const detail = await summary(chat)
+      if (chat.status === 401 || chat.status === 403) {
+        return { ok: false, status: chat.status, error: `Authentication was rejected${detail ? `: ${detail}` : "."}` }
+      }
+      // Some compatible servers expose /models but do not implement chat
+      // completions. Only then is the list allowed to stand in.
+      if (![404, 405].includes(chat.status) || !list?.ok) {
+        return {
+          ok: false,
+          status: chat.status,
+          modelFound: chat.status === 404 ? false : undefined,
+          ...(ids.length ? { models: ids.slice(0, 200) } : {}),
+          error: `The endpoint answered HTTP ${chat.status}${detail ? `: ${detail}` : "."}`,
+        }
+      }
+    }
+  }
 
   if (list?.ok) {
-    const ids = modelIDs(await list.json().catch(() => undefined))
-    if (input.modelID && ids.length > 0) {
-      const found = ids.includes(input.modelID)
+    if (input.modelID && ids.length > 0 && !ids.includes(input.modelID)) {
       return {
-        ok: found,
+        ok: false,
         status: list.status,
-        modelFound: found,
+        modelFound: false,
         models: ids.slice(0, 200),
-        ...(found ? {} : { error: `The endpoint lists ${ids.length} models, but not "${input.modelID}".` }),
+        error: `The endpoint lists ${ids.length} models, but not "${input.modelID}".`,
       }
     }
     return {
@@ -121,38 +175,6 @@ async function verify(input: z.infer<typeof Verify>): Promise<z.infer<typeof Res
   }
 
   const status = list?.status
-  if (status === 401 || status === 403) {
-    const detail = list ? await summary(list) : ""
-    return { ok: false, status, error: `Authentication was rejected${detail ? `: ${detail}` : "."}` }
-  }
-
-  // Some compatible servers do not implement GET /models. When a model is
-  // given, a minimal chat completion is the honest check: it exercises the
-  // same route a real turn uses.
-  if (input.modelID) {
-    const chat = await fetch(`${base}/chat/completions`, {
-      method: "POST",
-      headers: { ...auth, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: input.modelID,
-        messages: [{ role: "user", content: "ping" }],
-        max_tokens: 1,
-        stream: false,
-      }),
-      redirect: "error",
-      signal: AbortSignal.timeout(20_000),
-    }).catch(() => undefined)
-    if (!chat) return { ok: false, status, error: "The endpoint did not answer." }
-    if (chat.ok) return { ok: true, status: chat.status, modelFound: true }
-    const detail = await summary(chat)
-    return {
-      ok: false,
-      status: chat.status,
-      modelFound: chat.status === 404 ? false : undefined,
-      error: `The endpoint answered HTTP ${chat.status}${detail ? `: ${detail}` : "."}`,
-    }
-  }
-
   const detail = list ? await summary(list) : ""
   return {
     ok: false,
