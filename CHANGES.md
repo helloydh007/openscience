@@ -358,3 +358,70 @@ user-agent: openscience/2.0.153-local.1 ai-sdk/provider-utils/... runtime/bun/1.
 authorization: Bearer test-key
 → 对话正常完成（finish: stop）
 ```
+
+---
+
+# 第二轮改造：远程运行时与性能（2026-11-11）
+
+基于第一轮的调研结论实施（不基于 OpenCode v2）。六个工作流任务并行完成，经类型检查、测试门禁与独立评审复核。
+
+## 性能修复
+
+### 1. GET /provider 响应瘦身（`backend/cli/src/server/routes/provider.ts`）
+
+目录型（未连接）provider 不再逐个构建完整 models 目录，改为轻量 stub `{ id, source: "custom", name, env, options: {}, models: {} }`；connected provider 照旧完整构建并覆盖合并；`default` 只为 models 非空的 provider 计算（同时修掉了空数组取 `[0].id` 的潜在崩溃）。抽出纯函数 `slimProviderResponse` 并新增测试 `test/server/provider-list-slim.test.ts`。
+
+实测（相同内置目录、全新缓存）：
+
+| 指标 | 改造前 | 改造后 |
+| --- | --- | --- |
+| 首次请求 | 2.5–3.4 s | **0.32 s** |
+| 热请求 | 2.9–8 s | **5–9 ms** |
+| 响应体 | 4.1–6.5 MB | **19.5 KB** |
+
+### 2. Provider 状态懒构建（`backend/cli/src/provider/provider.ts`）
+
+`_loadState` 不再为目录里全部 provider（5760–8932 个 model）预构建完整对象，改为 stub + 按需物化：仅候选 provider（config、auth、env-key、CUSTOM_LOADERS、openai-codex、openrouter、github-copilot 等）在首次需要时完整构建。所有过滤后存活的 provider 行为与改前一致（`test/provider/lazy-catalog.test.ts` 回归锁定）。
+
+### 3. 科学环境按需安装（`backend/cli/src/index.ts`）
+
+启动不再自动预装 Python/R conda 环境（全新数据根曾触发 3.8 GB micromamba 安装与 UI 抢 CPU；已装数据根每次启动也要付两次解释器 import 探针）。缺失环境由首次内核请求按需走同一 lease-backed 安装；`OPENSCIENCE_PREWARM_ENVS=1` 可恢复旧的自动预热。实测：全新数据根启动不再创建 conda 目录，并输出一条 INFO 说明。
+
+## 远程运行时
+
+### 4. 桌面 SSH 连接管理器（`frontend/desktop/src/ssh-connections.mjs` 新增）
+
+- 保存的 SSH 连接（label/host/user/port/identityFile/remotePort）持久化在 userData（0600）；损坏的存储文件会在覆写前移到旁路留存，不再可能被静默清空（独立评审确认并修复的问题）。
+- 连接流程：探活 → 远程 sidecar 部署/升级（按版本比对，流式上传约 165MB，pid 文件温停旧进程）→ 启动远程 `serve` → 本地托管 `ssh -N -L 127.0.0.1:<local>:127.0.0.1:<remote>` 隧道（BatchMode、ExitOnForwardFailure、只绑回环）→ 健康检查后经既有确认框打开远程工作区窗口。
+- 断线自动重连（≤3 次）；退出时清理全部隧道；所有子进程数组参数、带超时，无明文密码。
+- 单元测试 `frontend/desktop/test/ssh-connections.test.mjs`（21 用例，含假 ssh 注入的状态机测试）。
+
+### 5. 工作区 SSH 连接界面（`dialog-select-server.tsx` 等）
+
+服务器选择对话框新增 SSH 区块（仅桌面环境显示）：连接列表 + 状态点、添加/编辑/删除表单、Connect/Disconnect；成功后由主进程打开远程窗口。桥接经 `preload.cjs → window.openscienceDesktop.ssh → platform`。
+
+### 6. Docker 运行时镜像与远程使用文档
+
+- `docker/Dockerfile.runtime`：ubuntu 22.04 + 非 root 用户 + sidecar 入口。
+- `docker/build-runtime.sh`：从已构建 sidecar 组装镜像，打印本地/远程 run 示例。
+- `docs/local-first/remote-runtime.md`：手动 SSH 隧道、SSH 管理器、Docker（本地与 `ssh host docker`）、安全边界（服务端固定 127.0.0.1，`-p` 端口发布触达不了 loopback-only 服务器，Linux 用 `--network host`——实测 `-p` 连接重置、host 网络 200）、断网语义与排障。
+
+### 远程使用速览
+
+```bash
+# 方式一（零配置）：手动隧道
+# 远程: openscience serve --port 4096   （systemd --user / tmux）
+# 本地: ssh -N -L 4096:127.0.0.1:4096 user@host
+# 桌面: Customize → Servers → Add http://127.0.0.1:4096
+
+# 方式二（本轮新增）：桌面 SSH 管理器自动完成部署+隧道+开窗
+```
+
+本地断网不影响远程 agent 继续执行；重连后经 `/runtime/snapshot` 与 SSE `Last-Event-ID` 恢复。断线中的权限询问会等待，无人值守需 Full access / standing approval。
+
+## 门禁与复核
+
+- `backend/cli` 与 `frontend/workspace` tsgo typecheck 通过。
+- `bun test test/provider/`：502 pass / 32 fail——32 个均为改造前既有失败（managed-route 依赖第一轮移除的账号会话 `getSession()=null`、bun 并行 flakiness），失败集合与基线逐字节一致，零新增；两个新测试文件全过。
+- 桌面 SSH 测试 21 pass。
+- 独立评审 1 条发现（SSH 存储损坏→保存静默清空）经独立确认员复现属实，已修复（损坏文件旁路留存 + 原子语义保存）。

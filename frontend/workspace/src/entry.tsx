@@ -89,6 +89,7 @@ if (import.meta.env.DEV && !(root instanceof HTMLElement)) {
 const platform: Platform = {
   platform: desktopUrl ? "desktop" : "web",
   openWorkspace: window.openscienceDesktop?.openWorkspace,
+  ssh: window.openscienceDesktop?.ssh,
   version: import.meta.env.VITE_OPENSCIENCE_VERSION || pkg.version,
   openLink(url: string) {
     window.open(url, "_blank", "noopener,noreferrer")

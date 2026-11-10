@@ -25,6 +25,8 @@ import { ExportCommand } from "./cli/cmd/export"
 import { ImportCommand } from "./cli/cmd/import"
 import { AcpCommand } from "./cli/cmd/acp"
 import { EOL } from "os"
+import fs from "node:fs/promises"
+import path from "node:path"
 import { WebCommand } from "./cli/cmd/web"
 import { PrCommand } from "./cli/cmd/pr"
 import { SessionCommand } from "./cli/cmd/session"
@@ -111,6 +113,27 @@ await purgeRetiredAtlasAgentInstall(Global.Path.home).catch((error) => {
   retiredAgentInstallCleanupError = error
 })
 
+// Whether both managed science starters already exist on disk. Mirrors the
+// preferred interpreter locations `ManagedEnvironments` launches with; a stale
+// answer only changes one startup log line, because the first kernel request
+// installs or repairs on demand either way.
+async function managedStartersInstalled() {
+  const executable = (file: string) =>
+    fs.access(file, process.platform === "win32" ? fs.constants.F_OK : fs.constants.X_OK).then(
+      () => true,
+      () => false,
+    )
+  const prefix = (language: "python" | "r") => path.join(Global.Path.data, "conda", "envs", language)
+  const interpreters =
+    process.platform === "win32"
+      ? [path.join(prefix("python"), "python.exe"), path.join(prefix("r"), "lib", "R", "bin", "x64", "Rscript.exe")]
+      : [path.join(prefix("python"), "bin", "python"), path.join(prefix("r"), "bin", "Rscript")]
+  for (const interpreter of interpreters) {
+    if (!(await executable(interpreter))) return false
+  }
+  return true
+}
+
 const cli = yargs(hideBin(process.argv))
   .parserConfiguration({ "populate--": true })
   .scriptName("openscience")
@@ -160,21 +183,32 @@ const cli = yargs(hideBin(process.argv))
         // Local-first build: no account credential sync and no session-trace upload.
       }
 
-      // First authenticated startup quietly provisions the app-owned Python
-      // and R starters. The command does not wait for package resolution; the
-      // first kernel request joins the same lease-backed setup if it is still
-      // running. OpenScience never modifies the user's Python, R, or Conda.
+      // Managed science environments are no longer provisioned at startup: on
+      // a fresh data root the eager prewarm kicked off a multi-gigabyte
+      // micromamba install that competed with the UI for CPU, and even a ready
+      // data root paid two full interpreter import probes on every launch.
+      // Missing starters are installed by the first kernel request, which runs
+      // the same lease-backed setup the prewarm used to drive;
+      // OPENSCIENCE_PREWARM_ENVS=1 restores the old eager prewarm. OpenScience
+      // never modifies the user's Python, R, or Conda.
       if (!capabilityCanary) {
-        const start = () =>
-          import("./science/kernel/environment-manager")
-            .then((m) => m.ManagedEnvironments.startInBackground())
-            .catch(() => {})
-        // The long-lived server commands (bare `openscience`, `web`, `serve`)
-        // defer the interpreter probes so they do not compete with workspace
-        // startup for CPU and disk; short-lived commands keep starting at once.
-        const server = !command || command === "web" || command === "serve"
-        if (server) setTimeout(start, 10_000).unref()
-        if (!server) await start()
+        const prewarm = process.env.OPENSCIENCE_PREWARM_ENVS === "1"
+        if (prewarm) {
+          const start = () =>
+            import("./science/kernel/environment-manager")
+              .then((m) => m.ManagedEnvironments.startInBackground())
+              .catch(() => {})
+          // The long-lived server commands (bare `openscience`, `web`, `serve`)
+          // defer the interpreter probes so they do not compete with workspace
+          // startup for CPU and disk; short-lived commands keep starting at once.
+          const server = !command || command === "web" || command === "serve"
+          if (server) setTimeout(start, 10_000).unref()
+          if (!server) await start()
+        } else if (!(await managedStartersInstalled())) {
+          Log.Default.info("managed science environments are not installed; they will be installed on first use", {
+            prewarm: "OPENSCIENCE_PREWARM_ENVS=1 restores startup pre-installation",
+          })
+        }
       }
     }
 

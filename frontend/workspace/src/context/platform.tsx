@@ -66,6 +66,9 @@ export type Platform = {
   /** Open an explicitly selected runtime in an isolated desktop window. */
   openWorkspace?(url: string): Promise<boolean>
 
+  /** Desktop SSH tunnel bridge (Electron preload only; undefined in the browser). */
+  ssh?: SSHBridge
+
   /** Fetch override */
   fetch?: typeof fetch
 

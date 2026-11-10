@@ -1,0 +1,34 @@
+# Headless runtime image for the local-first OpenScience fork: the prebuilt
+# sidecar on Ubuntu 22.04, matching the glibc 2.35 baseline of the AppImage
+# builder (docker/Dockerfile), so the same artifact runs on any 22.04+ host.
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+  && rm -rf /var/lib/apt/lists/*
+
+# uid/gid 1000 matches a typical workstation login, so host-mounted /data and
+# /workspace files stay owned by the person running the container.
+RUN groupadd -g 1000 openscience \
+  && useradd -m -u 1000 -g 1000 -s /usr/sbin/nologin openscience \
+  && mkdir -p /workspace /data \
+  && chown -R openscience:openscience /workspace /data
+
+# docker/build-runtime.sh stages the prebuilt sidecar into
+# <context>/sidecar/openscience. The server binds loopback only by design
+# (backend/cli/src/cli/network.ts:24-27), so a published port (-p) forwards to
+# the container's eth0 where nothing listens. Run the image with
+# --network host: the container's 127.0.0.1 then is the host's 127.0.0.1, which
+# keeps the "loopback only" security boundary intact.
+COPY sidecar/openscience /usr/local/bin/openscience
+RUN chmod +x /usr/local/bin/openscience
+
+ENV OPENSCIENCE_DATA_DIR=/data
+WORKDIR /workspace
+
+EXPOSE 4096
+USER openscience
+ENTRYPOINT ["/usr/local/bin/openscience", "serve", "--port", "4096"]

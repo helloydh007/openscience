@@ -9,6 +9,44 @@ import { mapValues } from "remeda"
 import { errors } from "../error"
 import { lazy } from "@synsci/util/lazy"
 
+// Directory (not-connected) providers ship as stubs: building the full
+// models.dev catalog for every provider made GET /provider cost seconds and
+// megabytes, and clients only consume full models for connected providers.
+function slimProviderInfo(provider: ModelsDev.Provider): Provider.Info {
+  return {
+    id: provider.id,
+    source: "custom",
+    name: provider.name,
+    env: provider.env ?? [],
+    options: {},
+    models: {},
+  }
+}
+
+// Pure GET /provider response builder so the slimming stays unit-testable:
+// catalog stubs go in first, connected providers overlay last (unchanged
+// Object.assign order), and providers with no models get no default entry.
+export function slimProviderResponse(
+  catalog: Record<string, ModelsDev.Provider>,
+  connected: Record<string, Provider.Info>,
+): { all: Provider.Info[]; default: Record<string, string>; connected: string[] } {
+  const providers: Record<string, Provider.Info> = Object.assign(
+    mapValues(catalog, slimProviderInfo),
+    connected,
+  )
+  const defaultModels: Record<string, string> = {}
+  for (const [id, provider] of Object.entries(providers)) {
+    const models = Provider.sort(Object.values(provider.models))
+    if (models.length === 0) continue
+    defaultModels[id] = models[0].id
+  }
+  return {
+    all: Object.values(providers).map(Provider.redact),
+    default: defaultModels,
+    connected: Object.keys(connected),
+  }
+}
+
 export const ProviderRoutes = lazy(() =>
   new Hono()
     .get(
@@ -57,16 +95,7 @@ export const ProviderRoutes = lazy(() =>
         }
 
         const connected = await Provider.list({ refresh: c.req.valid("query").refresh === "true" })
-        const providers = Object.assign(
-          mapValues(filteredProviders, (x) => Provider.fromModelsDevProvider(x)),
-          connected,
-        )
-        const redacted = Object.values(providers).map(Provider.redact)
-        return c.json({
-          all: redacted,
-          default: mapValues(providers, (item) => Provider.sort(Object.values(item.models))[0].id),
-          connected: Object.keys(connected),
-        })
+        return c.json(slimProviderResponse(filteredProviders, connected))
       },
     )
     .get(

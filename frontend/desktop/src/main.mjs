@@ -28,6 +28,7 @@ import { healthyRuntime, pinnedVersion } from "./service-health.mjs"
 import { servicePort } from "./service-port.mjs"
 import { logsDirectory, rotateLogs } from "./log-path.mjs"
 import { readAppearance, resolveAppearance, saveAppearance, splashQuery, sweepAppearance } from "./appearance.mjs"
+import { createSshManager } from "./ssh-connections.mjs"
 
 import { workspaceOrigin, workspaceHealth, workspaceNavigation } from "./remote-workspace.mjs"
 
@@ -1065,6 +1066,80 @@ async function createWindow(remote) {
 const lock = app.requestSingleInstanceLock()
 if (!lock) app.exit(0)
 
+// Managed SSH connections: stored records, remote sidecar deployment, and the
+// loopback tunnel a remote workspace opens through. Events fan out to local
+// windows only; remote workspace windows have no preload and must never learn
+// about SSH infrastructure.
+const sshManager = createSshManager({
+  userData: app.getPath("userData"),
+  sidecarPath: binary(),
+  version: app.getVersion(),
+})
+sshManager.onEvent((event) => {
+  for (const window of windows) {
+    if (!remoteWindows.has(window) && !window.isDestroyed()) window.webContents.send("openscience:ssh:event", event)
+  }
+})
+
+function sshSender(event) {
+  const owner = BrowserWindow.fromWebContents(event.sender)
+  if (!owner || !windows.has(owner) || remoteWindows.has(owner) || event.senderFrame !== event.sender.mainFrame) {
+    throw new Error("Only the local workspace can manage SSH connections")
+  }
+  return owner
+}
+
+ipcMain.handle("openscience:ssh:list", (event) => {
+  sshSender(event)
+  return sshManager.list()
+})
+
+ipcMain.handle("openscience:ssh:save", (event, input) => {
+  sshSender(event)
+  return sshManager.save(input)
+})
+
+ipcMain.handle("openscience:ssh:remove", (event, id) => {
+  sshSender(event)
+  return sshManager.remove(id)
+})
+
+ipcMain.handle("openscience:ssh:disconnect", (event, id) => {
+  sshSender(event)
+  return sshManager.disconnect(id)
+})
+
+ipcMain.handle("openscience:ssh:connect", async (event, id) => {
+  const owner = sshSender(event)
+  return sshManager.connect(id, {
+    // The tunnel is up; the workspace window opens only once the person
+    // confirms, and cancelling tears the tunnel back down. Mirrors the
+    // open-workspace confirm dialog.
+    onTunnelUp: async (url) => {
+      const prompt = await dialog.showMessageBox(owner, {
+        type: "question",
+        buttons: ["Open workspace", "Cancel"],
+        defaultId: 0,
+        cancelId: 1,
+        message: `Open workspace at ${url}?`,
+        detail:
+          "This window will use the OpenScience server running on the remote host through the SSH tunnel. Only connect to a runtime you trust. Your local workspace stays open.",
+      })
+      if (prompt.response !== 0 || owner.isDestroyed()) return false
+      try {
+        await createWindow(url)
+      } catch (error) {
+        dialog.showErrorBox(
+          "OpenScience could not open the remote workspace",
+          error instanceof Error ? error.message : String(error),
+        )
+        return false
+      }
+      return true
+    },
+  })
+})
+
 ipcMain.handle("openscience:open-workspace", async (event, value) => {
   const owner = BrowserWindow.fromWebContents(event.sender)
   if (
@@ -1224,6 +1299,8 @@ nativeTheme.on("updated", () => {
 })
 
 app.on("before-quit", (event) => {
+  // Tunnels must not outlive the app; the remote servers deliberately do.
+  sshManager.stopAll()
   if (state.exiting) return
   event.preventDefault()
   void stop()

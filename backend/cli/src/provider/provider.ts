@@ -2421,7 +2421,39 @@ export namespace Provider {
     using _ = log.time("state")
     const config = await Config.get()
     const modelsDev = await ModelsDev.get()
-    const database = mapValues(modelsDev, fromModelsDevProvider)
+    // A full catalog Info is expensive — every model runs through
+    // fromModelsDevModel and ProviderTransform.variants — and the credential
+    // gate below throws most of it away. Start from stubs that share the full
+    // build's id/source/name/env shape (only `models` is empty) and
+    // materialize real Info on demand, once per provider per state run;
+    // reuse across runs stays with the _stateCache revision.
+    const database: { [providerID: string]: Info } = mapValues(modelsDev, (provider): Info => ({
+      id: provider.id,
+      source: "custom",
+      name: provider.name,
+      env: provider.env ?? [],
+      options: {},
+      models: {},
+    }))
+    // Identity marker for the stubs still occupying `database`: entries written
+    // by config extend or a synthesis path replace their stub object, so a
+    // later ensureFull never rebuilds over them.
+    const stubs = new Set(Object.values(database))
+    /** Swap a stub for the full catalog Info and return the entry. Cheap passes
+     * (env detection, existence checks) may read stubs directly; anything that
+     * reaches models, options, a loader, or a merge must go through here so it
+     * never sees `models: {}`. Ids outside models.dev (config-only, synthesized)
+     * have no stub and pass through untouched. */
+    function ensureFull(providerID: string): Info | undefined {
+      const entry = database[providerID]
+      if (!entry || !stubs.has(entry)) return entry
+      const provider = modelsDev[providerID]
+      if (!provider) return undefined
+      const info = fromModelsDevProvider(provider)
+      database[providerID] = info
+      stubs.delete(entry)
+      return info
+    }
 
     const disabled = new Set(config.disabled_providers ?? [])
     const enabled = config.enabled_providers ? new Set(config.enabled_providers) : null
@@ -2469,9 +2501,27 @@ export namespace Provider {
 
     const configProviders = Object.entries(config.provider ?? {})
 
+    // Everything config, auth, a custom loader, or a synthesis path below can
+    // reach is built up front; every other catalog provider stays a stub until
+    // an env-key hit promotes it through mergeProvider. Plugin-declared auth
+    // providers only become known at Plugin.list() below, so they materialize
+    // at their loader call instead.
+    for (const providerID of [
+      ...configProviders.map(([id]) => id),
+      ...Object.keys(authEntries),
+      ...Object.keys(CUSTOM_LOADERS),
+      "openai",
+      "openai-codex",
+      "openrouter",
+      "github-copilot",
+      "github-copilot-enterprise",
+    ]) {
+      ensureFull(providerID)
+    }
+
     // Add GitHub Copilot Enterprise provider that inherits from GitHub Copilot
-    if (database["github-copilot"]) {
-      const githubCopilot = database["github-copilot"]
+    const githubCopilot = ensureFull("github-copilot")
+    if (githubCopilot) {
       database["github-copilot-enterprise"] = {
         ...githubCopilot,
         id: "github-copilot-enterprise",
@@ -2490,7 +2540,7 @@ export namespace Provider {
         providers[providerID] = mergeDeep(existing, provider)
         return
       }
-      const match = database[providerID]
+      const match = ensureFull(providerID)
       if (!match) return
       // @ts-expect-error
       providers[providerID] = mergeDeep(match, provider)
@@ -2498,7 +2548,7 @@ export namespace Provider {
 
     // extend database from config
     for (const [providerID, provider] of configProviders) {
-      const existing = database[providerID]
+      const existing = ensureFull(providerID)
       const parsed: Info = {
         id: providerID,
         name: provider.name ?? existing?.name ?? providerID,
@@ -2598,7 +2648,7 @@ export namespace Provider {
     // ``openai`` provider (BYOK api key) and the Codex OAuth provider
     // coexisting as separate registry entries. Matches backend's
     // ``openai-codex`` provider slug.
-    if (database["openai"] && (await Auth.get("openai-codex"))) {
+    if (ensureFull("openai") && (await Auth.get("openai-codex"))) {
       // Include both dot- and dash-normalized variants — models.dev's
       // snapshot normalizes dots to dashes (e.g. `gpt-5-5`) while the
       // OpenAI API expects dots (`gpt-5.5`). We pick up whichever the
@@ -2711,6 +2761,9 @@ export namespace Provider {
 
       // Load for the main provider if auth exists
       if (auth) {
+        // A plugin loader may read — the copilot loader also rewrites — the
+        // catalog models of its provider, so hand it the full Info.
+        ensureFull(plugin.auth.provider)
         const options = await plugin.auth.loader(() => Auth.get(providerID) as any, database[plugin.auth.provider])
         const opts = options ?? {}
         const patch: Partial<Info> = providers[providerID] ? { options: opts } : { source: "custom", options: opts }
@@ -2723,6 +2776,7 @@ export namespace Provider {
         if (!disabled.has(enterpriseProviderID)) {
           const enterpriseAuth = await Auth.get(enterpriseProviderID)
           if (enterpriseAuth) {
+            ensureFull(enterpriseProviderID)
             const enterpriseOptions = await plugin.auth.loader(
               () => Auth.get(enterpriseProviderID) as any,
               database[enterpriseProviderID],
@@ -2739,7 +2793,7 @@ export namespace Provider {
 
     for (const [providerID, fn] of Object.entries(CUSTOM_LOADERS)) {
       if (disabled.has(providerID)) continue
-      const data = database[providerID]
+      const data = ensureFull(providerID)
       if (!data) {
         log.error("Provider does not exist in model list " + providerID)
         continue

@@ -44,6 +44,7 @@
 
 .server-dialog__content {
   min-height: 0;
+  overflow-y: auto;
   display: flex;
   flex-direction: column;
 }
@@ -248,6 +249,101 @@
   border-radius: var(--radius-xs);
 }
 
+.server-dialog__ssh {
+  flex: 0 0 auto;
+  margin-top: 10px;
+  padding: 10px 18px 6px;
+  border-top: 1px solid var(--color-border-weak);
+}
+
+.server-dialog__ssh-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
+.server-dialog__ssh-title {
+  color: var(--color-text-muted);
+  font-size: var(--font-size-small);
+  font-weight: var(--font-weight-emphasis);
+}
+
+.server-dialog__ssh-list {
+  display: flex;
+  flex-direction: column;
+  max-height: 132px;
+  overflow-y: auto;
+}
+
+.server-dialog__ssh-row {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 40px;
+  padding: 2px 0;
+}
+
+.server-dialog__ssh-row + .server-dialog__ssh-row {
+  border-top: 1px solid var(--color-border-weak);
+}
+
+.server-dialog__ssh-identity {
+  min-width: 0;
+  display: flex;
+  flex: 1;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.server-dialog__ssh-label {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--color-text);
+  font-size: var(--font-size-base);
+  font-weight: var(--font-weight-medium);
+  line-height: 20px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.server-dialog__ssh-host {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--color-text-muted);
+  font-size: var(--font-size-small);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.server-dialog__ssh-actions {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 4px;
+}
+
+.server-dialog__ssh-empty {
+  padding: 10px 0 12px;
+  color: var(--color-text-muted);
+  font-size: var(--font-size-small);
+}
+
+.server-dialog__ssh-form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 8px 0 4px;
+}
+
+.server-dialog__ssh-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
 @media (pointer: coarse) {
   .server-dialog__list [data-slot="list-search"],
   .server-dialog__list [data-slot="list-search-input"] {
@@ -290,6 +386,10 @@
 
   .server-dialog__form-actions {
     margin-left: auto;
+  }
+
+  .server-dialog__ssh-fields {
+    grid-template-columns: minmax(0, 1fr);
   }
 }
 

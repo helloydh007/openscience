@@ -1,4 +1,4 @@
-import { createResource, createEffect, createMemo, onCleanup, Show, createSignal } from "solid-js"
+import { createResource, createEffect, createMemo, onCleanup, onMount, Show, createSignal, For } from "solid-js"
 import { createStore, reconcile } from "solid-js/store"
 import { useDialog } from "@synsci/ui/context/dialog"
 import { Dialog } from "@synsci/ui/dialog"
@@ -168,6 +168,296 @@ function EditRow(props: EditRowProps) {
         </Button>
       </div>
     </form>
+  )
+}
+
+type SSHStatus = "idle" | "connecting" | "uploading" | "connected" | "failed"
+
+const SSH_FORM_DEFAULTS = { label: "", host: "", user: "", port: "22", identityFile: "", remotePort: "4096" }
+
+function sshEventStatus(state: SSHEvent["state"]): SSHStatus {
+  if (state === "tunnel-up") return "connected"
+  if (state === "closed") return "idle"
+  return state
+}
+
+function sshEndpoint(connection: SSHConnectionRecord) {
+  return connection.port ? `${connection.host}:${connection.port}` : connection.host
+}
+
+function sshStatusClass(value: SSHStatus) {
+  if (value === "connected") return "bg-icon-success-base"
+  if (value === "failed") return "bg-icon-critical-base"
+  if (value === "connecting" || value === "uploading") return "bg-icon-warning-base"
+  return "bg-border-weak-base"
+}
+
+function parsePort(value: string) {
+  const parsed = Number.parseInt(value.trim(), 10)
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined
+}
+
+interface SSHSectionProps {
+  ssh: NonNullable<ReturnType<typeof usePlatform>["ssh"]>
+  onClose: () => void
+}
+
+function SSHSection(props: SSHSectionProps) {
+  const [connections, setConnections] = createSignal<SSHConnectionRecord[]>([])
+  const [status, setStatus] = createStore<Record<string, SSHStatus>>({})
+  const [form, setForm] = createStore({ ...SSH_FORM_DEFAULTS })
+  const [showForm, setShowForm] = createSignal(false)
+  const [busy, setBusy] = createSignal(false)
+  let listGeneration = 0
+
+  const report = (title: string, error: unknown) => {
+    showToast({
+      variant: "error",
+      title,
+      description: error instanceof Error ? error.message : String(error),
+    })
+  }
+
+  const refresh = async () => {
+    const generation = ++listGeneration
+    try {
+      const list = await props.ssh.list()
+      if (generation !== listGeneration) return
+      setConnections(list)
+    } catch (error) {
+      if (generation !== listGeneration) return
+      report("SSH servers unavailable", error)
+    }
+  }
+
+  onMount(() => void refresh())
+  // Events keep the per-connection dots current; dropping the subscription on
+  // unmount keeps the bridge from holding renderer callbacks.
+  onCleanup(props.ssh.onEvent((event) => setStatus(event.connectionId, sshEventStatus(event.state))))
+
+  const resetForm = () => {
+    setForm({ ...SSH_FORM_DEFAULTS })
+    setShowForm(false)
+  }
+
+  const handleSave = async () => {
+    const label = form.label.trim()
+    const host = form.host.trim()
+    if (busy() || !label || !host) return
+    setBusy(true)
+    try {
+      await props.ssh.save({
+        label,
+        host,
+        user: form.user.trim() || undefined,
+        port: parsePort(form.port),
+        identityFile: form.identityFile.trim() || undefined,
+        remotePort: parsePort(form.remotePort) ?? 4096,
+      })
+      resetForm()
+      await refresh()
+    } catch (error) {
+      report("SSH server not saved", error)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const handleConnect = async (connection: SSHConnectionRecord) => {
+    if (busy()) return
+    setBusy(true)
+    try {
+      const result = await props.ssh.connect(connection.id)
+      if (result.ok && result.url) {
+        // The main process opens the remote window; this dialog is done.
+        props.onClose()
+        return
+      }
+      report("SSH connection failed", result.error ?? `Could not connect to ${connection.label}.`)
+    } catch (error) {
+      report("SSH connection failed", error)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const handleDisconnect = async (connection: SSHConnectionRecord) => {
+    if (busy()) return
+    setBusy(true)
+    try {
+      await props.ssh.disconnect(connection.id)
+    } catch (error) {
+      report("SSH disconnect failed", error)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const handleRemove = async (connection: SSHConnectionRecord) => {
+    if (busy()) return
+    setBusy(true)
+    try {
+      await props.ssh.remove(connection.id)
+      await refresh()
+    } catch (error) {
+      report("SSH server not removed", error)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <div class="server-dialog__ssh">
+      <div class="server-dialog__ssh-header">
+        <span class="server-dialog__ssh-title">SSH servers</span>
+        <Show when={!showForm()}>
+          <Button
+            variant="ghost"
+            icon="plus-small"
+            size="normal"
+            disabled={busy()}
+            class="server-dialog__add-button"
+            onClick={() => setShowForm(true)}
+          >
+            Add SSH server
+          </Button>
+        </Show>
+      </div>
+      <div class="server-dialog__ssh-list">
+        <Show
+          when={connections().length}
+          fallback={<div class="server-dialog__ssh-empty">No SSH servers saved yet.</div>}
+        >
+          <For each={connections()}>
+            {(connection) => {
+              const state = () => status[connection.id] ?? "idle"
+              const active = () => state() === "connected" || state() === "connecting" || state() === "uploading"
+              return (
+                <div class="server-dialog__ssh-row">
+                  <div class={`server-dialog__status ${sshStatusClass(state())}`} />
+                  <div class="server-dialog__ssh-identity">
+                    <span class="server-dialog__ssh-label">{connection.label}</span>
+                    <span class="server-dialog__ssh-host">{sshEndpoint(connection)}</span>
+                  </div>
+                  <div class="server-dialog__ssh-actions">
+                    <Show
+                      when={active()}
+                      fallback={
+                        <Button
+                          size="small"
+                          variant="secondary"
+                          disabled={busy()}
+                          onClick={() => void handleConnect(connection)}
+                        >
+                          Connect
+                        </Button>
+                      }
+                    >
+                      <Button
+                        size="small"
+                        variant="secondary"
+                        disabled={busy()}
+                        onClick={() => void handleDisconnect(connection)}
+                      >
+                        Disconnect
+                      </Button>
+                    </Show>
+                    <Button
+                      size="small"
+                      variant="ghost"
+                      disabled={busy()}
+                      onClick={() => void handleRemove(connection)}
+                    >
+                      Remove
+                    </Button>
+                  </div>
+                </div>
+              )
+            }}
+          </For>
+        </Show>
+      </div>
+      <Show when={showForm()}>
+        <form
+          class="server-dialog__ssh-form"
+          onSubmit={(event) => {
+            event.preventDefault()
+            void handleSave()
+          }}
+        >
+          <div class="server-dialog__ssh-fields">
+            <TextField
+              type="text"
+              label="Label"
+              hideLabel
+              placeholder="Label"
+              value={form.label}
+              autofocus
+              disabled={busy()}
+              onChange={(value) => setForm("label", value)}
+            />
+            <TextField
+              type="text"
+              label="Host"
+              hideLabel
+              placeholder="Host"
+              value={form.host}
+              disabled={busy()}
+              onChange={(value) => setForm("host", value)}
+            />
+            <TextField
+              type="text"
+              label="User"
+              hideLabel
+              placeholder="User (optional)"
+              value={form.user}
+              disabled={busy()}
+              onChange={(value) => setForm("user", value)}
+            />
+            <TextField
+              type="text"
+              label="Port"
+              hideLabel
+              placeholder="Port (optional, 22)"
+              value={form.port}
+              disabled={busy()}
+              onChange={(value) => setForm("port", value)}
+            />
+            <TextField
+              type="text"
+              label="Identity file"
+              hideLabel
+              placeholder="Identity file (optional)"
+              value={form.identityFile}
+              disabled={busy()}
+              onChange={(value) => setForm("identityFile", value)}
+            />
+            <TextField
+              type="text"
+              label="Remote port"
+              hideLabel
+              placeholder="Remote port (4096)"
+              value={form.remotePort}
+              disabled={busy()}
+              onChange={(value) => setForm("remotePort", value)}
+            />
+          </div>
+          <div class="server-dialog__form-actions">
+            <Button type="button" size="small" variant="ghost" disabled={busy()} onClick={resetForm}>
+              Cancel
+            </Button>
+            <Button
+              type="submit"
+              size="small"
+              variant="primary"
+              disabled={busy() || !form.label.trim() || !form.host.trim()}
+            >
+              Save
+            </Button>
+          </div>
+        </form>
+      </Show>
+    </div>
   )
 }
 
@@ -721,6 +1011,10 @@ export function DialogSelectServer() {
             )
           }}
         </List>
+
+        <Show when={platform.ssh} keyed>
+          {(ssh) => <SSHSection ssh={ssh} onClose={() => dialog.close()} />}
+        </Show>
 
         <Show when={!store.addServer.showForm}>
           <div class="server-dialog__footer">
