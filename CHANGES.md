@@ -450,3 +450,14 @@ authorization: Bearer test-key
 - 本机 `~/.ssh/config` 的 3 个别名（debain / popos / agentbox）全部自动导入。
 - 对 `debain`（Linux x86_64，Tailscale 直连）做真实端到端：导入 → 连接 → 上传本地 sidecar → 启动 → 隧道健康检查通过；`/global/health` 返回 `version: 2.0.153-local.2`；远端 `sha256sum` 与本地构建一致（`08cbb8f7…`，BUILD 标记 `local-bundled`）；测试后已停止远端进程并清理 `~/.openscience/remote`。
 - `frontend/desktop/test/ssh-connections.test.mjs`：37 pass（新增 10 个用例：解析/Include/通配符、导入去重、只读、配置热更新、别名连接、同版本换字节重部署、远端摘要不一致拒绝）；`frontend/workspace` tsgo typecheck 通过。
+
+## 3. 远端端口占用与数据根隔离（修复"打开后要求登录"）
+
+用户报告：连本机 `agentbox` 打开远端窗口却出现账号登录页。排查结论：远端 4096 端口本来就跑着一份**旧的上游 OpenScience 2.0.153**（`/workspace/DHS/Daily/.osruntime/node_modules/@synsci/openscience-linux-x64/bin/openscience`），而旧逻辑只判断"端口健康"就认为部署完成 —— 于是本地自用版 sidecar 虽然上传成功（`BUILD … local-bundled`），却从未启动，隧道接到了那份带登录页的上游服务上。
+
+- **监听者身份校验**：`remoteServer()` 读该端口的监听进程 `/proc/<pid>/exe` + `/global/health`；只有可执行文件是 `~/.openscience/remote/bin/openscience` 才算"自己的"，健康但非自己不作数。等待启动时也只接受"自己的"健康响应（`waitForOwnServer()`）。
+- **端口回退**：目标端口被别的服务占用时不动对方，一次 `ss -ltn` 取回全部监听端口，自动选择相邻空闲端口（如 4096 → 4097）启动本构建，并把端口持久化到连接记录，后续连接复用。
+- **数据根隔离**：远端 server 以 `OPENSCIENCE_DATA_DIR=$HOME/.openscience/remote/data` 及同目录 `XDG_*` 启动。除避免与宿主其它安装共用配置外，也修掉了容器里 `~/.config` 为 root 所有导致的 `EACCES: permission denied, mkdir '~/.config/openscience'` 启动失败。
+- 新增 2 个用例（占用时切端口 + 复用已选端口不重启），并断言启动命令带隔离的数据根；桌面测试 39 pass。
+
+实测 `agentbox`：连接提示 `Port 4096 … already used by another OpenScience (2.0.153); using port 4097` → 启动本构建 → 隧道健康 `2.0.153-local.1` → 远端窗口直接进入 Projects 页（截图与 DOM 文本均无登录）。远端 4097 上的 server 保留运行，连接记录已记住 4097。

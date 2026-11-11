@@ -41,6 +41,27 @@ case "$cmd" in
     if [ -n "\${FAKE_SSH_DIGEST:-}" ]; then printf '%s\\n' "\${FAKE_SSH_DIGEST}"; fi
     exit 0
     ;;
+  *"setsid nohup "*)
+    port=\$(printf '%s' "$cmd" | sed -n 's/.*--port \\([0-9][0-9]*\\).*/\\1/p')
+    printf '%s' "$port" > "\${FAKE_SSH_STATE}"
+    exit 0
+    ;;
+  "pid="*)
+    port=\$(printf '%s' "$cmd" | sed -n 's/.*sport = :\\([0-9][0-9]*\\).*/\\1/p')
+    running=\$(cat "\${FAKE_SSH_STATE}" 2>/dev/null || true)
+    if [ -n "$running" ] && [ "$running" = "$port" ]; then
+      printf '%s\\n' "\${FAKE_SSH_EXE:-/home/dev/.openscience/remote/bin/openscience}"
+      printf '{"healthy":true,"version":"%s"}\\n' "\${FAKE_SSH_OURS_VERSION:-9.9.9}"
+    elif [ -n "\${FAKE_SSH_FOREIGN:-}" ] && [ "$port" = "\${FAKE_SSH_FOREIGN_PORT:-4096}" ]; then
+      printf '%s\\n' "/workspace/runtime/node_modules/@synsci/openscience-linux-x64/bin/openscience"
+      printf '{"healthy":true,"version":"%s"}\\n' "\${FAKE_SSH_FOREIGN}"
+    fi
+    exit 0
+    ;;
+  "(ss -ltnH"*)
+    printf '%s' "\${FAKE_SSH_LISTEN:-}"
+    exit 0
+    ;;
   "cat > "*) bytes=\$(wc -c); printf '%s\\n' "upload: $bytes" >> "$log"; exit 0 ;;
   curl*) exit 1 ;;
   tail*) printf 'FATAL: listen tcp 127.0.0.1:4096: bind: address already in use\\n' ;;
@@ -63,10 +84,14 @@ function setup({ probe, healthDeadlineMs = 1_000, sshConfig } = {}) {
   const sshConfigPath = path.join(dir, "ssh-config")
   if (sshConfig !== undefined) writeFileSync(sshConfigPath, sshConfig)
   process.env.FAKE_SSH_LOG = path.join(dir, "fake-ssh.log")
+  process.env.FAKE_SSH_STATE = path.join(dir, "fake-ssh-state")
   process.env.FAKE_SSH_DIGEST = digest
   delete process.env.FAKE_SSH_PROBE_EXIT
   delete process.env.FAKE_SSH_VERSION
   delete process.env.FAKE_SSH_BUILD
+  delete process.env.FAKE_SSH_FOREIGN
+  delete process.env.FAKE_SSH_FOREIGN_PORT
+  delete process.env.FAKE_SSH_LISTEN
   const manager = createSshManager({
     userData: dir,
     sidecarPath: sidecar,
@@ -103,10 +128,14 @@ beforeAll(() => {
 afterEach(() => {
   while (cleanups.length) cleanups.pop()()
   delete process.env.FAKE_SSH_LOG
+  delete process.env.FAKE_SSH_STATE
   delete process.env.FAKE_SSH_PROBE_EXIT
   delete process.env.FAKE_SSH_VERSION
   delete process.env.FAKE_SSH_BUILD
   delete process.env.FAKE_SSH_DIGEST
+  delete process.env.FAKE_SSH_FOREIGN
+  delete process.env.FAKE_SSH_FOREIGN_PORT
+  delete process.env.FAKE_SSH_LISTEN
 })
 
 describe("connection validation", () => {
@@ -554,7 +583,11 @@ describe("connect state machine", () => {
     expect(text).toContain("local-bundled")
     expect(text).toContain("> ~/.openscience/remote/BUILD")
     expect(text).toContain("> ~/.openscience/remote/VERSION")
-    expect(text).toContain("cmd: setsid nohup ~/.openscience/remote/bin/openscience serve --port 4096")
+    expect(text).toContain("setsid nohup ~/.openscience/remote/bin/openscience serve --port 4096")
+    // The deployed server gets an isolated data root so it neither reads nor
+    // writes another OpenScience install's configuration.
+    expect(text).toContain("OPENSCIENCE_DATA_DIR=$HOME/.openscience/remote/data")
+    expect(text).toContain("XDG_CONFIG_HOME=$HOME/.openscience/remote/config")
     expect(text).toContain("echo $! > ~/.openscience/remote/server.pid")
     expect(text).toContain("-L 127.0.0.1:")
     expect(text).toContain(":127.0.0.1:4096")
@@ -572,6 +605,46 @@ describe("connect state machine", () => {
     await manager.disconnect(saved.id)
   })
 
+  test("a foreign server on the remote port is left alone and this build takes a free port", async () => {
+    const { manager, log } = setup({ sshConfig: `Host lab\n  HostName 10.0.0.9\n  User sci\n` })
+    // Another OpenScience build (for example an older upstream release that
+    // still asks for an account) already listens on 4096.
+    process.env.FAKE_SSH_FOREIGN = "2.0.153"
+    process.env.FAKE_SSH_LISTEN = "1096 4096"
+    const events = []
+    manager.onEvent((event) => events.push(event))
+    const imported = manager.list()[0]
+    const result = await manager.connect(imported.id)
+    expect(result.ok).toBe(true)
+    await waitForLog(log, "tunnel:")
+    const text = log()
+    // Ours starts next to the foreign server, and the tunnel points at ours.
+    expect(text).toContain("serve --port 4097")
+    expect(text).toContain(":127.0.0.1:4097")
+    expect(text).not.toContain("serve --port 4096")
+    expect(events.some((event) => event.message?.includes("another OpenScience (2.0.153)"))).toBe(true)
+    // The fallback port is persisted, so the next connect reuses it.
+    expect(manager.list()[0].remotePort).toBe(4097)
+    await manager.disconnect(imported.id)
+  })
+
+  test("after the fallback, later connects reuse the chosen port without restarting", async () => {
+    const { manager, log } = setup({ sshConfig: `Host lab\n  HostName 10.0.0.9\n` })
+    process.env.FAKE_SSH_FOREIGN = "2.0.153"
+    process.env.FAKE_SSH_LISTEN = "4096"
+    const imported = manager.list()[0]
+    expect((await manager.connect(imported.id)).ok).toBe(true)
+    await manager.disconnect(imported.id)
+    const starts = log().match(/serve --port 4097/g)?.length ?? 0
+    expect(starts).toBe(1)
+    expect((await manager.connect(imported.id)).ok).toBe(true)
+    const after = log().match(/serve --port 4097/g)?.length ?? 0
+    // The second connect found our own healthy server on 4097 and did not
+    // start another one.
+    expect(after).toBe(1)
+    await manager.disconnect(imported.id)
+  })
+
   test("an up-to-date remote skips the upload entirely", async () => {
     const { manager, log, digest } = setup()
     process.env.FAKE_SSH_VERSION = "9.9.9"
@@ -586,7 +659,7 @@ describe("connect state machine", () => {
     expect(text).not.toContain("upload:")
     expect(text).not.toContain("cmd: mv ~/.openscience")
     expect(text).not.toContain("sha256sum")
-    expect(text).toContain("cmd: setsid nohup")
+    expect(text).toContain("setsid nohup")
     await manager.disconnect(saved.id)
   })
 

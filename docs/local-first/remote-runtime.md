@@ -89,7 +89,13 @@ ssh -N -L 4096:127.0.0.1:4096 gpu-host
 
 远端 server 以 `setsid nohup` 常驻（日志 `~/.openscience/remote/server.log`，PID `server.pid`），要求远端有 `curl`。断开隧道**不会**停止远端 server，退出桌面也不会——这是为了让长任务在本地断网/关机后继续跑；要停就 `ssh <host> 'kill "$(cat ~/.openscience/remote/server.pid)"'`。
 
-实测（本机配置的 `debain`，Linux x86_64）：连接后 `/global/health` 返回 `version: 2.0.153-local.2`，远端 `sha256sum` 与本地 sidecar 完全一致。
+**端口被别的服务占用时**（本机 `agentbox` 上的真实案例：远端 4096 早已跑着旧的上游 OpenScience 2.0.153，打开后会显示账号登录页）：
+
+- 桌面会读该端口监听进程的 `/proc/<pid>/exe`，只有 `~/.openscience/remote/bin/openscience` 才算"自己部署的那份"；健康检查通过但进程不是自己的**不算**成功，不会把隧道接过去。
+- 端口被占用时不会去动对方：自动在 `4096` 之后找一个空闲端口（如 `4097`）启动本构建，并把选中的端口写回连接记录，下次连接直接复用；界面会提示 `Port 4096 … is already used by another OpenScience (2.0.153); using port 4097`。
+- 远端 server 以 `OPENSCIENCE_DATA_DIR=$HOME/.openscience/remote/data` 和同目录下的 `XDG_CONFIG_HOME`/`XDG_CACHE_HOME`/`XDG_DATA_HOME` 启动：既不读宿主上其它 OpenScience 安装的配置，也不要求 `~/.config` 可写（容器里 `~/.config` 常是 root 所有，直接启动会 `EACCES`）。
+
+实测（本机配置的 `debain`，Linux x86_64）：连接后 `/global/health` 返回 `version: 2.0.153-local.2`，远端 `sha256sum` 与本地 sidecar 完全一致。`agentbox`（4096 被上游 2.0.153 占用）：自动切到 4097，健康返回 `2.0.153-local.1`，远端窗口直接是 Projects 页，无登录。
 
 ### B.3 连接之后
 
@@ -153,7 +159,7 @@ ssh -N -L 4096:127.0.0.1:4096 gpu-host      # 本地隧道，随后按 A.3 连�
 1. **服务端固定 `127.0.0.1`**：没有任何 flag / 环境变量能改绑定地址（`backend/cli/src/cli/network.ts:24-27`），不存在"误听公网"的配置路径。
 2. **不要公网直连**：不要在远程主机防火墙开放 4096，也不要把它挂在反代/公网 IP 上。服务没有为公网暴露设计的鉴权层，公网可回环 = 任何人可控制你的会话。
 3. **隧道是默认安全边界**：谁能 ssh 到远程主机，谁才能用这个服务。`-L 4096:127.0.0.1:4096` 只转发远端回环，宿主外部接口上的流量到不了服务。
-4. **远程主机需自配模型 key**：凭据存在服务端数据目录的 `auth.json`（`backend/cli/src/auth/index.ts:56`），远程 server 不会复用你本机的 key。连接远端 server 后在 Customize 的 Provider keys / 凭据页配置，或把本机 `<data>/auth.json` 拷贝过去。模型请求由远端 server 发出，走的也是远端的网络。
+4. **远程主机需自配模型 key**：凭据存在服务端数据目录的 `auth.json`（`backend/cli/src/auth/index.ts:56`），远程 server 不会复用你本机的 key。Manager 部署的 server 数据目录固定为 `~/.openscience/remote/data`，连接远端 server 后在 Customize 的 Provider keys / 凭据页配置，或把本机 `<data>/auth.json` 拷贝到远端 `~/.openscience/remote/data/auth.json`。模型请求由远端 server 发出，走的也是远端的网络。
 5. **权限模式同样生效**：项目级 `Ask always / Ask risky / Full access`（`ProjectAccess`，CHANGES.md 任务 3）在远程会话中一致；`Full access` 会跳过日常工具确认，切换时保留一次确认对话框，且显式 `deny` 规则与付费远程计算的预算审批仍会询问。
 
 ---

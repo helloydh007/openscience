@@ -730,29 +730,152 @@ export function createSshManager({
         { action: "Recording the deployed OpenScience build" },
       )
     }
-    if (!(await remoteHealthy(record))) {
+    // A healthy port is not proof that this desktop owns the server behind it.
+    // An older upstream build (or any other service) can hold the port, and
+    // tunnelling to it would silently show that server's UI — including the
+    // account login this fork removed. Identify the listener first.
+    const server = await remoteServer(record, record.remotePort)
+    if (server.healthy && server.ours && server.version === version) return record
+
+    let effective = record
+    if (server.listening && !server.ours) {
+      // Leave a foreign listener untouched and serve this build from a free
+      // port next to it; the chosen port is persisted so reconnects reuse it.
+      const used = await remoteListeningPorts(record)
+      const port = firstFreePort(record, used)
+      if (port === undefined)
+        throw new Error(
+          `Remote port ${record.remotePort} on ${sshTarget(record)} is already in use by another service and no free port was found nearby`,
+        )
+      effective = adoptRemotePort(record, port)
+      emit({
+        connectionId: record.id,
+        state: "uploading",
+        message: `Port ${record.remotePort} on ${sshTarget(record)} is already used by ${
+          server.version ? `another OpenScience (${server.version})` : "another service"
+        }; using port ${port}`,
+      })
+    } else if (server.ours) {
+      // Our own older build (or a half-started one) still holds the port but
+      // does not match the desktop bundle; restart it in place so the freshly
+      // deployed binary is the one that serves.
       await sshExec(
         [
           ...base,
           target,
-          `setsid nohup ${REMOTE_BIN} serve --port ${record.remotePort} >> ${REMOTE_ROOT}/server.log 2>&1 & echo $! > ${REMOTE_ROOT}/server.pid`,
+          `if [ -f ${REMOTE_ROOT}/server.pid ]; then kill "$(cat ${REMOTE_ROOT}/server.pid)" 2>/dev/null || true; sleep 1; fi`,
         ],
-        { action: "Starting the remote OpenScience server" },
+        { action: "Stopping the previous remote OpenScience server" },
       )
+    }
+    // The deployed server gets its own data root under the deployment
+    // directory. Besides isolating it from any other OpenScience install on
+    // the host, this keeps it working when ~/.config is not writable by the
+    // SSH user (common in containers, where ~/.config may be root-owned).
+    const env = [
+      `OPENSCIENCE_DATA_DIR=$HOME/.openscience/remote/data`,
+      `XDG_CONFIG_HOME=$HOME/.openscience/remote/config`,
+      `XDG_CACHE_HOME=$HOME/.openscience/remote/cache`,
+      `XDG_DATA_HOME=$HOME/.openscience/remote/share`,
+    ].join(" ")
+    await sshExec(
+      [
+        ...base,
+        target,
+        `${env} setsid nohup ${REMOTE_BIN} serve --port ${effective.remotePort} >> ${REMOTE_ROOT}/server.log 2>&1 & echo $! > ${REMOTE_ROOT}/server.pid`,
+      ],
+      { action: "Starting the remote OpenScience server" },
+    )
+    if (!(await waitForOwnServer(effective))) {
+      const tail = await remoteLogTail(effective)
+      const cause = `The remote OpenScience server did not become healthy with the expected identity within ${Math.max(
+        1,
+        Math.round(HEALTH_DEADLINE_MS / 1000),
+      )} seconds`
+      throw new Error(tail ? `${cause}.\nRemote log tail:\n${tail}` : cause)
+    }
+    return effective
+  }
+
+  /**
+   * Identifies the process listening on one remote loopback port: its resolved
+   * executable and the health payload it serves. `ours` is the essential bit —
+   * a truthy healthy flag alone says nothing about which build is answering.
+   */
+  async function remoteServer(record, port) {
+    const command = [
+      `pid=$( (ss -ltnpH "sport = :${port}" 2>/dev/null || ss -ltnp 2>/dev/null | grep -F ":${port} ") | sed -n 's/.*pid=\\([0-9][0-9]*\\).*/\\1/p' | head -n1)`,
+      `if [ -n "$pid" ]; then readlink -f /proc/$pid/exe 2>/dev/null || true; fi`,
+      `curl -fsS --max-time 3 http://127.0.0.1:${port}/global/health 2>/dev/null || true`,
+    ].join("; ")
+    const result = await runProcess(sshExecutable, [...sshBaseArgs(record), sshTarget(record), command], {
+      timeoutMs: 12_000,
+    })
+    if (result.code !== 0) return { listening: false, healthy: false, ours: false, version: undefined }
+    const lines = result.stdout
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean)
+    const exe = lines.find((line) => line.startsWith("/")) ?? ""
+    const healthLine = lines.find((line) => line.startsWith("{")) ?? ""
+    let health
+    try {
+      health = JSON.parse(healthLine)
+    } catch {}
+    const reported = typeof health?.version === "string" ? health.version : undefined
+    const ours = exe
+      ? exe.endsWith("/.openscience/remote/bin/openscience")
+      : // No readable /proc: fall back to the version this desktop deployed.
+        health?.healthy === true && reported === version
+    return {
+      listening: Boolean(exe) || health !== undefined,
+      healthy: health?.healthy === true,
+      ours,
+      version: reported,
     }
   }
 
-  async function remoteHealthy(record) {
-    const result = await runProcess(
-      sshExecutable,
-      [
-        ...sshBaseArgs(record),
-        sshTarget(record),
-        `curl -fsS --max-time 3 http://127.0.0.1:${record.remotePort}/global/health >/dev/null 2>&1`,
-      ],
-      { timeoutMs: 10_000 },
+  /** Every TCP port currently listening on the remote, in one ssh round-trip. */
+  async function remoteListeningPorts(record) {
+    const command = `(ss -ltnH 2>/dev/null || netstat -ltn 2>/dev/null) | sed -n 's/.*[.:]\\([0-9][0-9]*\\)[[:space:]].*/\\1/p' | sort -un | tr '\\n' ' '`
+    const result = await runProcess(sshExecutable, [...sshBaseArgs(record), sshTarget(record), command], {
+      timeoutMs: 12_000,
+    })
+    if (result.code !== 0) return new Set()
+    return new Set(
+      result.stdout
+        .split(/\s+/)
+        .map((value) => Number.parseInt(value, 10))
+        .filter((value) => Number.isInteger(value) && value >= 1 && value <= 65_535),
     )
-    return result.code === 0
+  }
+
+  function firstFreePort(record, used) {
+    const limit = Math.min(65_535, record.remotePort + 40)
+    for (let port = record.remotePort + 1; port <= limit; port++) {
+      if (!used.has(port)) return port
+    }
+    return undefined
+  }
+
+  /** Persists the port the desktop fell back to, so reconnects keep using it. */
+  function adoptRemotePort(record, port) {
+    const connections = derived().all.map((connection) =>
+      connection.id === record.id ? { ...connection, remotePort: port } : connection,
+    )
+    persist(connections)
+    return connections.find((connection) => connection.id === record.id) ?? { ...record, remotePort: port }
+  }
+
+  /** Polls until the deployed binary itself answers health, not just any server. */
+  async function waitForOwnServer(record) {
+    const deadline = Date.now() + HEALTH_DEADLINE_MS
+    while (Date.now() < deadline) {
+      const server = await remoteServer(record, record.remotePort)
+      if (server.healthy && server.ours) return true
+      await pause(300)
+    }
+    return false
   }
 
   async function remoteLogTail(record) {
@@ -901,9 +1024,11 @@ export function createSshManager({
     active.set(id, session)
     try {
       emit({ connectionId: id, state: "connecting" })
-      await deploy(record)
+      // deploy() may move the server to a free remote port when the configured
+      // one is occupied by a server this desktop did not deploy.
+      session.connection = await deploy(record)
       if (!(await openTunnel(session))) {
-        const tail = await remoteLogTail(record)
+        const tail = await remoteLogTail(session.connection)
         const cause = session.tunnelExit
           ? `The SSH tunnel ${session.tunnelExit} before the remote server became healthy`
           : `The remote OpenScience server did not become healthy within ${Math.max(1, Math.round(healthDeadlineMs / 1000))} seconds`
