@@ -270,6 +270,29 @@
   font-weight: var(--font-weight-emphasis);
 }
 
+.server-dialog__ssh-heading {
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.server-dialog__ssh-meta {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--color-text-muted);
+  font-size: var(--font-size-small);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.server-dialog__ssh-header-actions {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 4px;
+}
+
 .server-dialog__ssh-list {
   display: flex;
   flex-direction: column;
@@ -316,6 +339,17 @@
   font-size: var(--font-size-small);
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.server-dialog__ssh-badge {
+  margin-left: 6px;
+  padding: 1px 6px;
+  border-radius: var(--radius-xs);
+  background: var(--color-surface-raised);
+  color: var(--color-text-muted);
+  font-size: var(--font-size-x-small);
+  font-weight: var(--font-weight-regular);
+  vertical-align: 1px;
 }
 
 .server-dialog__ssh-actions {

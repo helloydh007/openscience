@@ -1094,6 +1094,11 @@ ipcMain.handle("openscience:ssh:list", (event) => {
   return sshManager.list()
 })
 
+ipcMain.handle("openscience:ssh:sync", (event) => {
+  sshSender(event)
+  return sshManager.sync()
+})
+
 ipcMain.handle("openscience:ssh:save", (event, input) => {
   sshSender(event)
   return sshManager.save(input)

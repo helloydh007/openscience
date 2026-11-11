@@ -182,7 +182,13 @@ function sshEventStatus(state: SSHEvent["state"]): SSHStatus {
 }
 
 function sshEndpoint(connection: SSHConnectionRecord) {
-  return connection.port ? `${connection.host}:${connection.port}` : connection.host
+  const endpoint = connection.port ? `${connection.host}:${connection.port}` : connection.host
+  // An imported row is an alias: show the alias first and what OpenSSH will
+  // resolve it to, so two aliases pointing at one host stay distinguishable.
+  if (connection.origin === "ssh-config" && connection.alias && connection.alias !== connection.host) {
+    return `${connection.alias} → ${endpoint}`
+  }
+  return endpoint
 }
 
 function sshStatusClass(value: SSHStatus) {
@@ -234,6 +240,23 @@ function SSHSection(props: SSHSectionProps) {
   // Events keep the per-connection dots current; dropping the subscription on
   // unmount keeps the bridge from holding renderer callbacks.
   onCleanup(props.ssh.onEvent((event) => setStatus(event.connectionId, sshEventStatus(event.state))))
+
+  const importedCount = () => connections().filter((connection) => connection.origin === "ssh-config").length
+
+  // The import is derived from ~/.ssh/config on every list; Sync makes the
+  // derived set explicit after the person edits that file with the app open.
+  const handleSync = async () => {
+    if (busy()) return
+    setBusy(true)
+    try {
+      await props.ssh.sync()
+      await refresh()
+    } catch (error) {
+      report("SSH config import failed", error)
+    } finally {
+      setBusy(false)
+    }
+  }
 
   const resetForm = () => {
     setForm({ ...SSH_FORM_DEFAULTS })
@@ -309,24 +332,47 @@ function SSHSection(props: SSHSectionProps) {
   return (
     <div class="server-dialog__ssh">
       <div class="server-dialog__ssh-header">
-        <span class="server-dialog__ssh-title">SSH servers</span>
-        <Show when={!showForm()}>
+        <div class="server-dialog__ssh-heading">
+          <span class="server-dialog__ssh-title">SSH servers</span>
+          <span class="server-dialog__ssh-meta">
+            <Show when={importedCount() > 0} fallback={<>~/.ssh/config is imported automatically</>}>
+              {importedCount()} from ~/.ssh/config (read-only)
+            </Show>
+          </span>
+        </div>
+        <div class="server-dialog__ssh-header-actions">
           <Button
             variant="ghost"
-            icon="plus-small"
+            icon="refresh"
             size="normal"
             disabled={busy()}
             class="server-dialog__add-button"
-            onClick={() => setShowForm(true)}
+            onClick={() => void handleSync()}
           >
-            Add SSH server
+            Sync
           </Button>
-        </Show>
+          <Show when={!showForm()}>
+            <Button
+              variant="ghost"
+              icon="plus-small"
+              size="normal"
+              disabled={busy()}
+              class="server-dialog__add-button"
+              onClick={() => setShowForm(true)}
+            >
+              Add SSH server
+            </Button>
+          </Show>
+        </div>
       </div>
       <div class="server-dialog__ssh-list">
         <Show
           when={connections().length}
-          fallback={<div class="server-dialog__ssh-empty">No SSH servers saved yet.</div>}
+          fallback={
+            <div class="server-dialog__ssh-empty">
+              No SSH servers saved yet. Hosts in ~/.ssh/config are imported automatically.
+            </div>
+          }
         >
           <For each={connections()}>
             {(connection) => {
@@ -336,7 +382,12 @@ function SSHSection(props: SSHSectionProps) {
                 <div class="server-dialog__ssh-row">
                   <div class={`server-dialog__status ${sshStatusClass(state())}`} />
                   <div class="server-dialog__ssh-identity">
-                    <span class="server-dialog__ssh-label">{connection.label}</span>
+                    <span class="server-dialog__ssh-label">
+                      {connection.label}
+                      <Show when={connection.origin === "ssh-config"}>
+                        <span class="server-dialog__ssh-badge">~/.ssh/config</span>
+                      </Show>
+                    </span>
                     <span class="server-dialog__ssh-host">{sshEndpoint(connection)}</span>
                   </div>
                   <div class="server-dialog__ssh-actions">
@@ -362,14 +413,16 @@ function SSHSection(props: SSHSectionProps) {
                         Disconnect
                       </Button>
                     </Show>
-                    <Button
-                      size="small"
-                      variant="ghost"
-                      disabled={busy()}
-                      onClick={() => void handleRemove(connection)}
-                    >
-                      Remove
-                    </Button>
+                    <Show when={connection.origin !== "ssh-config"}>
+                      <Button
+                        size="small"
+                        variant="ghost"
+                        disabled={busy()}
+                        onClick={() => void handleRemove(connection)}
+                      >
+                        Remove
+                      </Button>
+                    </Show>
                   </div>
                 </div>
               )

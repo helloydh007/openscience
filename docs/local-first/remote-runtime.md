@@ -65,13 +65,39 @@ ssh -N -L 4096:127.0.0.1:4096 gpu-host
 
 ## B. 桌面端 SSH 连接管理器（本次新功能）
 
-连接管理器把 A 节的手工步骤收敛到桌面里：维护一份 SSH 主机配置（主机、用户、密钥来源），一键建立并维持到远端的隧道，然后把隧道落在的 `http://127.0.0.1:4096` 注册进 Servers 列表。典型流程：
+入口：首页右上角服务器胶囊（`● Local server`）→「服务器」对话框 → 底部 **SSH servers** 区块；命令面板（Ctrl/Cmd+K）搜 **Switch server** 也能打开。该区块只在打包的桌面端出现（依赖 preload 桥），浏览器标签页里没有。
 
-1. 打开连接管理器，添加主机（地址 / 用户 / 密钥），先做一次连通性测试；
-2. 连接后由桌面负责隧道建立与断线重连，远端侧不需要你手动放 systemd/tmux（用 docker 的话见 C 节，服务端仍然在远程主机上以容器常驻）；
-3. 连接成功后，Servers 对话框里会出现 `http://127.0.0.1:4096`，状态点变绿即可使用，后续切换与设为默认与 A.3 相同。
+### B.1 自动导入 `~/.ssh/config`
 
-具体入口与字段以随本功能发布的实际界面为准。底层语义与 A 节完全一致：远端 server 只监听远端回环，隧道是唯一通道。
+打开对话框时就会读取当前用户的 `~/.ssh/config`，把 `Host` 别名直接列出来（带 `~/.ssh/config` 徽标，只读）：
+
+- 支持 `HostName` / `User` / `Port` / `IdentityFile`、`Key=value` 写法、引号值，以及 `Include`（`~`、相对 `~/.ssh`、通配符、嵌套，均有深度/文件数上限）。
+- 通配符 Host（如 `Host *`）与 `Match` 块**不导入**：它们描述默认值或条件，不是可直接连接的别名；同名别名取第一次声明，与 OpenSSH 的 first-match 规则一致。
+- 导入项只读：要改/删请改 `~/.ssh/config`；点 **Sync** 可立即重新读取（每次打开对话框也会自动刷新）。
+- 手工添加的记录优先：同 label、或同 host/user/port 的手工记录会遮蔽对应的导入项。
+- 连接时只把**别名**交给 ssh（`ssh lab`），`HostName`/`User`/`Port`/`ProxyJump`/`IdentityFile` 全部由 OpenSSH 自己解析，因此 `IdentitiesOnly`、跳板机等配置保持原语义。
+
+### B.2 对面没装 OpenScience 时自动安装（本地自用版）
+
+连接时桌面会探测远端，并在下面任一条件成立时部署：
+
+- `~/.openscience/remote/BUILD` 不存在；或
+- 标记里的版本与桌面版本不同；或
+- 标记里的 sha256 与**桌面自带 sidecar** 的 sha256 不同（同版本号但字节不同，例如上游发行版，也会被替换）。
+
+部署过程：把桌面自己的 sidecar 通过 SSH stdin 流式写入远端 staging → `mv` 到 `~/.openscience/remote/bin/openscience` → `sha256sum` 校验远端字节与本地构建一致 → 写 `BUILD`（`<version> <sha256> local-bundled`）和 `VERSION`。**不会从 GitHub 或任何下载源拉取**，远端跑的就是本机这个无遥测构建；校验不一致会直接报错，不会启动隧道。
+
+远端 server 以 `setsid nohup` 常驻（日志 `~/.openscience/remote/server.log`，PID `server.pid`），要求远端有 `curl`。断开隧道**不会**停止远端 server，退出桌面也不会——这是为了让长任务在本地断网/关机后继续跑；要停就 `ssh <host> 'kill "$(cat ~/.openscience/remote/server.pid)"'`。
+
+实测（本机配置的 `debain`，Linux x86_64）：连接后 `/global/health` 返回 `version: 2.0.153-local.2`，远端 `sha256sum` 与本地 sidecar 完全一致。
+
+### B.3 连接之后
+
+- 隧道落在**本机随机回环端口**（不是固定 4096），确认对话框后**新开一个窗口**指向 `http://127.0.0.1:<port>`；本地窗口保持不动，标题栏显示 `<主机名> — …`。
+- 隧道意外断开会自动重连，最多 3 次；手动 **Disconnect** 只关闭隧道与远端窗口会话，不重连。
+- 远端 server 的模型凭据独立于本机（见 D.4），首次连接后需要在远端窗口的 Customize 里配置，或把本机 `<data>/auth.json` 拷过去。
+
+底层语义与 A 节完全一致：远端 server 只监听远端回环，SSH 隧道是唯一通道。
 
 ---
 

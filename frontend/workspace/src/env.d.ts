@@ -22,6 +22,10 @@ interface SSHConnectionRecord {
   identityFile?: string
   remotePort: number
   createdAt: number
+  /** Present on records imported from ~/.ssh/config: the OpenSSH alias itself. */
+  alias?: string
+  /** "ssh-config" marks a derived, read-only record; absent means user-entered. */
+  origin?: "ssh-config"
 }
 
 interface SSHConnectionInput {
@@ -42,6 +46,7 @@ interface SSHEvent {
 
 interface SSHBridge {
   list(): Promise<SSHConnectionRecord[]>
+  sync(): Promise<{ imported: number; total: number }>
   save(input: SSHConnectionInput): Promise<SSHConnectionRecord>
   remove(id: string): Promise<void>
   connect(id: string): Promise<{ ok: boolean; url?: string; error?: string }>

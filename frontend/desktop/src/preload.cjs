@@ -6,6 +6,7 @@ contextBridge.exposeInMainWorld("openscienceDesktop", {
   openWorkspace: (url) => ipcRenderer.invoke("openscience:open-workspace", url),
   ssh: {
     list: () => ipcRenderer.invoke("openscience:ssh:list"),
+    sync: () => ipcRenderer.invoke("openscience:ssh:sync"),
     save: (input) => ipcRenderer.invoke("openscience:ssh:save", input),
     remove: (id) => ipcRenderer.invoke("openscience:ssh:remove", id),
     connect: (id) => ipcRenderer.invoke("openscience:ssh:connect", id),

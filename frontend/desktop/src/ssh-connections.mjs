@@ -1,7 +1,17 @@
 import { spawn } from "node:child_process"
-import { randomUUID } from "node:crypto"
-import { createReadStream, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs"
+import { createHash, randomUUID } from "node:crypto"
+import {
+  createReadStream,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  statSync,
+  writeFileSync,
+} from "node:fs"
 import { createServer } from "node:net"
+import os from "node:os"
 import path from "node:path"
 
 // Managed SSH connections for the desktop shell: stored records, remote
@@ -25,6 +35,13 @@ const OUTPUT_CAP = 65_536
 // The fixed remote layout the deployed sidecar lives in.
 const REMOTE_ROOT = "~/.openscience/remote"
 const REMOTE_BIN = `${REMOTE_ROOT}/bin/openscience`
+// Bounds for ~/.ssh/config expansion: Include may nest and may use globs, so
+// both the recursion depth and the number of files read are capped.
+const SSH_CONFIG_MAX_DEPTH = 8
+const SSH_CONFIG_MAX_FILES = 64
+// Imported records are aliases, not copies of the settings they resolve to:
+// ssh itself reads ~/.ssh/config, so a record only has to name the alias.
+const SSH_CONFIG_ORIGIN = "ssh-config"
 
 const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
@@ -39,6 +56,9 @@ export function shq(value) {
  * acceptance, and keepalives so a dead route is noticed.
  */
 export function sshBaseArgs(connection) {
+  // Imported aliases leave identity, port, and everything else to OpenSSH so
+  // ProxyJump, Match blocks, and IdentitiesOnly keep their usual meaning.
+  const imported = connection.origin === SSH_CONFIG_ORIGIN && Boolean(connection.alias)
   return [
     "-o",
     "BatchMode=yes",
@@ -48,12 +68,15 @@ export function sshBaseArgs(connection) {
     "StrictHostKeyChecking=accept-new",
     "-o",
     "ServerAliveInterval=15",
-    ...(connection.port ? ["-p", String(connection.port)] : []),
-    ...(connection.identityFile ? ["-i", connection.identityFile] : []),
+    ...(imported || !connection.port ? [] : ["-p", String(connection.port)]),
+    ...(imported || !connection.identityFile ? [] : ["-i", connection.identityFile]),
   ]
 }
 
 export function sshTarget(connection) {
+  // The alias goes to ssh verbatim: HostName, User, Port, IdentityFile, and
+  // ProxyJump all come from the user's own ~/.ssh/config.
+  if (connection.origin === SSH_CONFIG_ORIGIN && connection.alias) return connection.alias
   return connection.user ? `${connection.user}@${connection.host}` : connection.host
 }
 
@@ -77,6 +100,225 @@ function boundedPort(value, name) {
   if (value === undefined || value === null || value === "") return undefined
   if (!Number.isInteger(value) || value < 1 || value > 65_535) throw new Error(`The ${name} must be 1 to 65535`)
   return value
+}
+
+/**
+ * Splits one ~/.ssh/config line into a keyword and its value. OpenSSH accepts
+ * "Key value" and "Key=value", quoted values, and a trailing # comment, so
+ * this mirrors those three rules and nothing more.
+ */
+function directive(line) {
+  const match = /^([A-Za-z][A-Za-z0-9]*)\s*(?:=\s*)?(.*)$/.exec(line)
+  if (!match) return undefined
+  let value = ""
+  let quote
+  for (const char of match[2]) {
+    if (quote) {
+      if (char === quote) quote = undefined
+      value += char
+    } else if (char === '"' || char === "'") {
+      quote = char
+      value += char
+    } else if (char === "#") {
+      break
+    } else {
+      value += char
+    }
+  }
+  value = value.trim()
+  if (value.length >= 2 && (value[0] === '"' || value[0] === "'") && value.at(-1) === value[0]) {
+    value = value.slice(1, -1)
+  }
+  return { key: match[1], value }
+}
+
+/**
+ * Parses ssh_config text into the connectable aliases it declares.
+ *
+ * Wildcard and negated patterns describe defaults or exclusions, not a host
+ * anyone can connect to, so they are skipped; Match blocks are skipped whole
+ * because their conditions are OpenSSH's to evaluate, not ours. The first
+ * value wins within a Host block, matching OpenSSH's own precedence.
+ */
+export function parseSshConfig(text) {
+  const entries = []
+  const declared = new Set()
+  let block = []
+  let inHost = false
+  for (const raw of String(text ?? "").split(/\r?\n/)) {
+    const line = raw.trim()
+    if (!line || line.startsWith("#")) continue
+    const parsed = directive(line)
+    if (!parsed) continue
+    const key = parsed.key.toLowerCase()
+    if (key === "host") {
+      inHost = true
+      block = []
+      for (const pattern of parsed.value.split(/\s+/)) {
+        if (!pattern || /[*?!]/.test(pattern)) continue
+        // First declaration wins, exactly like OpenSSH's first-match rule.
+        if (declared.has(pattern)) continue
+        declared.add(pattern)
+        const entry = { alias: pattern }
+        entries.push(entry)
+        block.push(entry)
+      }
+      continue
+    }
+    if (key === "match") {
+      inHost = false
+      block = []
+      continue
+    }
+    if (!inHost) continue
+    for (const entry of block) {
+      if (key === "hostname" && entry.hostName === undefined) entry.hostName = parsed.value
+      else if (key === "user" && entry.user === undefined) entry.user = parsed.value
+      else if (key === "port" && entry.port === undefined) {
+        const port = Number.parseInt(parsed.value, 10)
+        if (Number.isInteger(port) && port >= 1 && port <= 65_535) entry.port = port
+      } else if (key === "identityfile" && entry.identityFile === undefined) {
+        entry.identityFile = parsed.value
+      }
+    }
+  }
+  return entries
+}
+
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+}
+
+function readdirSafe(directory) {
+  try {
+    return readdirSync(directory).sort()
+  } catch {
+    return []
+  }
+}
+
+/**
+ * One glob segment: * and ? only, which is what ssh_config Include patterns
+ * use in practice. Matching is per path segment so * never crosses a slash.
+ */
+function segmentMatcher(segment) {
+  const source = segment
+    .split("")
+    .map((char) => (char === "*" ? ".*" : char === "?" ? "." : escapeRegExp(char)))
+    .join("")
+  return new RegExp(`^${source}$`)
+}
+
+function walkGlob(segments, index, current, output, depth) {
+  if (depth > SSH_CONFIG_MAX_DEPTH || output.length >= SSH_CONFIG_MAX_FILES) return
+  if (index >= segments.length) {
+    try {
+      if (statSync(current).isFile()) output.push(current)
+    } catch {}
+    return
+  }
+  const segment = segments[index]
+  if (segment === "**") {
+    walkGlob(segments, index + 1, current, output, depth + 1)
+    for (const name of readdirSafe(current)) {
+      const next = path.join(current, name)
+      try {
+        if (statSync(next).isDirectory()) walkGlob(segments, index, next, output, depth + 1)
+      } catch {}
+    }
+    return
+  }
+  if (!/[*?]/.test(segment)) {
+    walkGlob(segments, index + 1, path.join(current, segment), output, depth)
+    return
+  }
+  const matcher = segmentMatcher(segment)
+  for (const name of readdirSafe(current)) {
+    if (matcher.test(name)) walkGlob(segments, index + 1, path.join(current, name), output, depth)
+  }
+}
+
+function expandGlob(pattern) {
+  const output = []
+  const absolute = pattern.startsWith("/")
+  const segments = pattern.split("/").filter((segment) => segment.length > 0)
+  walkGlob(segments, 0, absolute ? path.parse(pattern).root : ".", output, 0)
+  return output.sort()
+}
+
+/**
+ * Resolves an Include path the way OpenSSH does: "~" is the local home,
+ * relative paths are relative to ~/.ssh, and the result may be a glob. "~user"
+ * expansion is deliberately unsupported instead of guessed.
+ */
+function includeMatches(pattern, homeDir, sshDir) {
+  let resolved
+  if (pattern === "~") resolved = homeDir
+  else if (pattern.startsWith("~/")) resolved = path.join(homeDir, pattern.slice(2))
+  else if (pattern.startsWith("~")) return []
+  else if (path.isAbsolute(pattern)) resolved = pattern
+  else resolved = path.join(sshDir, pattern)
+  return expandGlob(resolved)
+}
+
+function inlineIncludes(file, homeDir, sshDir, seen, depth) {
+  if (depth > SSH_CONFIG_MAX_DEPTH || seen.size >= SSH_CONFIG_MAX_FILES) return ""
+  let text
+  try {
+    text = readFileSync(file, "utf8")
+  } catch {
+    return ""
+  }
+  const output = []
+  for (const line of text.split(/\r?\n/)) {
+    const trimmed = line.trim()
+    if (!trimmed || trimmed.startsWith("#")) {
+      output.push(line)
+      continue
+    }
+    const parsed = directive(trimmed)
+    if (!parsed || parsed.key.toLowerCase() !== "include") {
+      output.push(line)
+      continue
+    }
+    for (const pattern of parsed.value.split(/\s+/)) {
+      if (!pattern) continue
+      for (const included of includeMatches(pattern, homeDir, sshDir)) {
+        if (seen.has(included)) continue
+        seen.add(included)
+        output.push(inlineIncludes(included, homeDir, sshDir, seen, depth + 1))
+      }
+    }
+  }
+  return output.join("\n")
+}
+
+/**
+ * Reads an ssh_config file with its Include directives expanded in place — the
+ * same order OpenSSH processes them, so a Host block spanning an Include keeps
+ * its context. A missing file is simply an empty config.
+ */
+export function readSshConfig(configPath, { homeDir = os.homedir() } = {}) {
+  const seen = new Set([path.resolve(configPath)])
+  const text = inlineIncludes(configPath, homeDir, path.dirname(configPath), seen, 0)
+  return parseSshConfig(text)
+}
+
+/** The stored shape of an imported alias. Read-only in the UI: the file wins. */
+export function configConnection(entry, prior) {
+  return {
+    id: `sshconfig:${entry.alias}`,
+    label: entry.alias,
+    host: entry.hostName ?? entry.alias,
+    ...(entry.user ? { user: entry.user } : {}),
+    ...(entry.port ? { port: entry.port } : {}),
+    alias: entry.alias,
+    origin: SSH_CONFIG_ORIGIN,
+    remotePort: prior?.remotePort ?? 4096,
+    // Derived records carry no real creation time; a stable 0 keeps the
+    // merged list byte-identical across reads, so list() never writes.
+    createdAt: prior?.createdAt ?? 0,
+  }
 }
 
 /**
@@ -126,6 +368,21 @@ export function validateConnection(input) {
     remotePort,
     createdAt: Date.now(),
   }
+}
+
+/**
+ * Accepts an imported record as-is except for the one field the desktop still
+ * owns: the remote port the server listens on. The alias is passed as a single
+ * argv to ssh, so it only has to be free of whitespace and a leading hyphen.
+ */
+function resolveImported(stored) {
+  if (typeof stored.alias !== "string" || !/^[A-Za-z0-9._+-]+$/.test(stored.alias) || stored.alias.startsWith("-"))
+    throw new Error("The imported SSH alias is not safe to pass to ssh")
+  if (typeof stored.label !== "string" || stored.label.length < 1 || stored.label.length > 120)
+    throw new Error("The imported SSH alias has an invalid label")
+  const remotePort = boundedPort(stored.remotePort, "remote port")
+  if (remotePort === undefined) throw new Error("The remote port is required and must be 1 to 65535")
+  return { ...stored, remotePort }
 }
 
 /**
@@ -227,6 +484,10 @@ export function createSshManager({
   probe = defaultProbe,
   healthDeadlineMs = HEALTH_DEADLINE_MS,
   healthIntervalMs = HEALTH_INTERVAL_MS,
+  // The user's own OpenSSH client configuration, parsed for aliases. Tests
+  // point this at a fixture so the real ~/.ssh/config never leaks in.
+  sshConfigPath = path.join(os.homedir(), ".ssh", "config"),
+  homeDir = os.homedir(),
 }) {
   if (!/^[\w.+-]+$/.test(String(version ?? "")))
     throw new Error("The desktop version is not safe for remote deployment")
@@ -306,12 +567,56 @@ export function createSshManager({
   }
 
   function list() {
-    return load()
+    return derived().all
+  }
+
+  /**
+   * Manual records plus the aliases declared in ~/.ssh/config. The import is
+   * derived on every read, so adding or removing a Host in the file shows up
+   * without a restart. A manual record wins on the same label or the same
+   * resolved endpoint, so importing can never shadow a connection the person
+   * typed in by hand. Imported records are read-only: the file is the source
+   * of truth and an edit here would be overwritten by the next import.
+   */
+  function derived() {
+    const stored = load()
+    const manual = stored.filter((connection) => connection.origin !== SSH_CONFIG_ORIGIN)
+    const prior = new Map(
+      stored
+        .filter((connection) => connection.origin === SSH_CONFIG_ORIGIN)
+        .map((connection) => [connection.id, connection]),
+    )
+    let entries = []
+    try {
+      entries = readSshConfig(sshConfigPath, { homeDir })
+    } catch {}
+    const labels = new Set(manual.map((connection) => connection.label.toLowerCase()))
+    const endpoints = new Set(
+      manual.map((connection) => `${connection.host}\u0000${connection.user ?? ""}\u0000${connection.port ?? ""}`),
+    )
+    const imported = []
+    for (const entry of entries) {
+      const record = configConnection(entry, prior.get(`sshconfig:${entry.alias}`))
+      if (labels.has(record.label.toLowerCase())) continue
+      const endpoint = `${record.host}\u0000${record.user ?? ""}\u0000${record.port ?? ""}`
+      if (endpoints.has(endpoint)) continue
+      imported.push(record)
+    }
+    return { manual, imported, all: [...manual, ...imported] }
+  }
+
+  /** Persists the current import; the dialog's Sync button calls this. */
+  function sync() {
+    const { all, imported } = derived()
+    if (JSON.stringify(all) !== JSON.stringify(load())) persist(all)
+    return { imported: imported.length, total: all.length }
   }
 
   function save(input) {
+    if (typeof input?.id === "string" && input.id.startsWith("sshconfig:"))
+      throw new Error("This SSH server comes from ~/.ssh/config; edit that file instead")
     const record = validateConnection(input)
-    const connections = load()
+    const connections = derived().all
     const index = connections.findIndex((connection) => connection.id === record.id)
     if (index >= 0) {
       // An update keeps the original creation time; everything else is replaced.
@@ -324,8 +629,9 @@ export function createSshManager({
   }
 
   async function remove(id) {
+    if (id.startsWith("sshconfig:")) throw new Error("This SSH server comes from ~/.ssh/config; edit that file instead")
     await disconnect(id)
-    persist(load().filter((connection) => connection.id !== id))
+    persist(derived().all.filter((connection) => connection.id !== id))
   }
 
   async function sshExec(args, { timeoutMs = COMMAND_TIMEOUT_MS, action }) {
@@ -341,26 +647,56 @@ export function createSshManager({
     if (result.code !== 0) throw new Error(execFailure(result, action))
   }
 
+  // The sidecar this desktop ships is the local, telemetry-free build. Its
+  // digest is part of the deploy decision so a remote that happens to carry
+  // the same version string but different bytes (for example an upstream
+  // release) is replaced rather than trusted.
+  let localDigest
+  async function sidecarDigest() {
+    if (localDigest) return localDigest
+    if (!existsSync(sidecarPath)) throw new Error(`The local OpenScience sidecar is missing: ${sidecarPath}`)
+    const hash = createHash("sha256")
+    await new Promise((resolve, reject) => {
+      const stream = createReadStream(sidecarPath)
+      stream.on("data", (chunk) => hash.update(chunk))
+      stream.on("error", reject)
+      stream.on("end", resolve)
+    })
+    localDigest = hash.digest("hex")
+    return localDigest
+  }
+
   /**
-   * Deploys the desktop's own sidecar when the remote VERSION marker
-   * disagrees — warm-stopping the previous server first — then makes sure a
-   * server for this connection's remote port is listening. An up-to-date
-   * remote never restarts anything.
+   * Deploys the desktop's own bundled sidecar when the remote BUILD marker
+   * disagrees on version or digest — warm-stopping the previous server first —
+   * then makes sure a server for this connection's remote port is listening.
+   * An up-to-date remote never restarts or re-uploads anything. The binary is
+   * always streamed from this desktop's own bundle: nothing is fetched from a
+   * release server, so the remote runs the same local, telemetry-free build.
    */
   async function deploy(record) {
     const target = sshTarget(record)
     const base = sshBaseArgs(record)
+    const digest = await sidecarDigest()
     await sshExec([...base, target, "true"], { timeoutMs: PROBE_TIMEOUT_MS, action: `Reaching ${target}` })
     await sshExec([...base, target, `mkdir -p ${REMOTE_ROOT}/bin ${REMOTE_ROOT}/staging`], {
       action: "Creating the remote OpenScience directories",
     })
-    const installed = (
-      await sshExec([...base, target, `cat ${REMOTE_ROOT}/VERSION 2>/dev/null || true`], {
-        action: "Reading the deployed OpenScience version",
+    // BUILD holds "<version> <sha256> <origin>". VERSION is kept for readers
+    // of the older layout; the deploy decision uses the digest, not just the
+    // version string.
+    const marker = (
+      await sshExec([...base, target, `cat ${REMOTE_ROOT}/BUILD 2>/dev/null || true`], {
+        action: "Reading the deployed OpenScience build",
       })
     ).trim()
-    if (installed !== version) {
-      emit({ connectionId: record.id, state: "uploading", message: `Deploying OpenScience ${version} to ${target}` })
+    const [installedVersion, installedDigest] = marker.split(/\s+/)
+    if (installedVersion !== version || installedDigest !== digest) {
+      emit({
+        connectionId: record.id,
+        state: "uploading",
+        message: `Deploying the bundled local OpenScience ${version} (no telemetry) to ${target}`,
+      })
       await sshExec(
         [
           ...base,
@@ -369,16 +705,29 @@ export function createSshManager({
         ],
         { action: "Stopping the previous remote OpenScience server" },
       )
-      if (!existsSync(sidecarPath)) throw new Error(`The local OpenScience sidecar is missing: ${sidecarPath}`)
       const staged = `${REMOTE_ROOT}/staging/openscience-${version}`
       await upload([...base, target, `cat > ${staged}`], sidecarPath, `Uploading OpenScience ${version} to ${target}`)
+      await sshExec([...base, target, `mv ${staged} ${REMOTE_BIN} && chmod 755 ${REMOTE_BIN}`], {
+        action: "Activating the uploaded OpenScience build",
+      })
+      // The remote bytes must be this desktop's bytes: a truncated or mangled
+      // upload is caught here instead of failing later inside the server.
+      const remoteDigest = (
+        await sshExec([...base, target, `sha256sum ${REMOTE_BIN} 2>/dev/null | cut -d' ' -f1 || true`], {
+          action: "Verifying the deployed OpenScience build",
+        })
+      ).trim()
+      if (remoteDigest && remoteDigest !== digest)
+        throw new Error(
+          `The uploaded OpenScience binary does not match the local build (local ${digest}, remote ${remoteDigest})`,
+        )
       await sshExec(
         [
           ...base,
           target,
-          `mv ${staged} ${REMOTE_BIN} && chmod 755 ${REMOTE_BIN} && printf %s ${shq(version)} > ${REMOTE_ROOT}/VERSION`,
+          `printf '%s %s local-bundled\\n' ${shq(version)} ${shq(digest)} > ${REMOTE_ROOT}/BUILD && printf %s ${shq(version)} > ${REMOTE_ROOT}/VERSION`,
         ],
-        { action: "Activating the uploaded OpenScience build" },
+        { action: "Recording the deployed OpenScience build" },
       )
     }
     if (!(await remoteHealthy(record))) {
@@ -528,12 +877,12 @@ export function createSshManager({
    */
   async function connect(id, { onTunnelUp } = {}) {
     if (quitting) return { ok: false, error: "OpenScience is quitting" }
-    const stored = load().find((connection) => connection.id === id)
+    const stored = derived().all.find((connection) => connection.id === id)
     if (!stored) return { ok: false, error: `No SSH connection has id ${id}` }
     if (active.has(id)) return { ok: false, error: `${stored.label} is already connecting or connected` }
     let record
     try {
-      record = validateConnection(stored)
+      record = stored.origin === SSH_CONFIG_ORIGIN ? resolveImported(stored) : validateConnection(stored)
     } catch (error) {
       return { ok: false, error: error instanceof Error ? error.message : String(error) }
     }
@@ -607,5 +956,5 @@ export function createSshManager({
     }
   }
 
-  return { list, save, remove, connect, disconnect, stopAll, onEvent }
+  return { list, sync, save, remove, connect, disconnect, stopAll, onEvent }
 }

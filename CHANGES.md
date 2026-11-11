@@ -373,11 +373,11 @@ authorization: Bearer test-key
 
 实测（相同内置目录、全新缓存）：
 
-| 指标 | 改造前 | 改造后 |
-| --- | --- | --- |
-| 首次请求 | 2.5–3.4 s | **0.32 s** |
-| 热请求 | 2.9–8 s | **5–9 ms** |
-| 响应体 | 4.1–6.5 MB | **19.5 KB** |
+| 指标     | 改造前     | 改造后      |
+| -------- | ---------- | ----------- |
+| 首次请求 | 2.5–3.4 s  | **0.32 s**  |
+| 热请求   | 2.9–8 s    | **5–9 ms**  |
+| 响应体   | 4.1–6.5 MB | **19.5 KB** |
 
 ### 2. Provider 状态懒构建（`backend/cli/src/provider/provider.ts`）
 
@@ -425,3 +425,28 @@ authorization: Bearer test-key
 - `bun test test/provider/`：502 pass / 32 fail——32 个均为改造前既有失败（managed-route 依赖第一轮移除的账号会话 `getSession()=null`、bun 并行 flakiness），失败集合与基线逐字节一致，零新增；两个新测试文件全过。
 - 桌面 SSH 测试 21 pass。
 - 独立评审 1 条发现（SSH 存储损坏→保存静默清空）经独立确认员复现属实，已修复（损坏文件旁路留存 + 原子语义保存）。
+
+---
+
+# 第三轮改造：SSH 配置自动导入与本地自用版远程安装（2026-11-11）
+
+## 1. 自动导入 `~/.ssh/config`（`frontend/desktop/src/ssh-connections.mjs`）
+
+- 新增 `readSshConfig()` / `parseSshConfig()`：读取当前用户 `~/.ssh/config`，导入 `Host` 别名及其 `HostName`/`User`/`Port`/`IdentityFile`；支持 `Key=value`、引号值、`Include`（`~`、相对 `~/.ssh`、通配符、嵌套，深度 ≤8、文件 ≤64）。
+- 通配符 Host 与 `Match` 块不导入（默认值/条件不是可连接别名）；同名别名取第一次声明，与 OpenSSH first-match 一致。
+- 导入项是**派生记录**（`origin: "ssh-config"`、`alias`），每次 `list()` 重新读取，因此编辑配置文件后无需重启；UI 标记为只读（`~/.ssh/config` 徽标，隐藏 Remove），并提供 **Sync** 按钮。
+- 手工记录优先：同 label 或同 host/user/port 的手工连接会遮蔽导入项，避免导入覆盖用户输入。
+- 连接时只把别名交给 ssh（`ssh <alias>`），不追加 `-p`/`-i`/`user@`，`ProxyJump`、`Match`、`IdentitiesOnly` 等仍由 OpenSSH 解析。
+
+## 2. 对面未安装时自动部署本地自用版 server
+
+- 部署判定从“只看 VERSION”升级为“`BUILD` 标记的版本 + sha256”：同版本号但字节不同（例如上游发行版）也会被替换。
+- 始终上传**桌面自带的 sidecar**（本地无遥测构建），不访问 GitHub 或任何下载源；上传后远端 `sha256sum` 与本地比对，不一致直接报错、不启动隧道。
+- 写入 `~/.openscience/remote/BUILD`：`<version> <sha256> local-bundled`，同时保留 `VERSION` 兼容旧读取方。
+- 事件文案显式标注 `(no telemetry)`，日志可追溯。
+
+## 实测
+
+- 本机 `~/.ssh/config` 的 3 个别名（debain / popos / agentbox）全部自动导入。
+- 对 `debain`（Linux x86_64，Tailscale 直连）做真实端到端：导入 → 连接 → 上传本地 sidecar → 启动 → 隧道健康检查通过；`/global/health` 返回 `version: 2.0.153-local.2`；远端 `sha256sum` 与本地构建一致（`08cbb8f7…`，BUILD 标记 `local-bundled`）；测试后已停止远端进程并清理 `~/.openscience/remote`。
+- `frontend/desktop/test/ssh-connections.test.mjs`：37 pass（新增 10 个用例：解析/Include/通配符、导入去重、只读、配置热更新、别名连接、同版本换字节重部署、远端摘要不一致拒绝）；`frontend/workspace` tsgo typecheck 通过。
