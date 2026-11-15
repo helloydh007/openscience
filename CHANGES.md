@@ -502,3 +502,21 @@ authorization: Bearer test-key
 - `cd frontend/desktop && bun test test/`：**50 pass / 0 fail**（2 文件：ssh-connections 47 用例 + remote-sync 3 用例；本轮新增运行时选择/持久化/拒绝无效 id、同步清单与远端 `$HOME` 锚定、staging 整体替换、软失败语义等用例）。
 - `cd frontend/workspace && bun run typecheck`（tsgo -b）：exit 0。
 - 本节为文档工程师依据最终代码撰写；仓库内未见本轮的独立评审记录，以上只记录本机实际执行的门禁，未运行的门禁未列入。
+
+---
+
+# 第五轮改造：启动内存事故防护（2026-11-15）
+
+## 事故与结论
+
+用户报告启动即巨卡，内核 OOM 杀掉 `app-synsci-desktop-405225.scope` 内进程。取证（journalctl -k / dmesg OOM 表）：
+
+- 被杀进程 anon-rss **6.5GB + swapents 18.7GB ≈ 25GB 匿名内存**（启动 ~35s 后）；排除 Electron 主进程、renderer（adj=300）、zygote；sidecar 当时存活并在 7s 后正常优雅退出。候选为 gpu / network-utility 子进程。
+- 事发时系统 25GB swap 仅剩 **132kB**，同时段 ZCode Desktop 正对离线的 agentbox/popos 做重连风暴并以 0.01MB/s 爬行 SFTP 上传，NVIDIA 驱动（NVRM）也在报 Out of memory。
+- 同条件复现（相同 userData/数据根，25 分钟逐秒采样）内存完全平稳（main 297MB / sidecar 282MB / gpu 181MB / renderer 136MB）——排除本轮代码存在确定性启动泄漏；models.dev 响应实测仅 122KB，排除响应缓冲。
+
+## 防护（`frontend/desktop/src/memory-watchdog.mjs` 新增）
+
+- **逐进程内存看门狗**：每 10s 采样 `app.getAppMetrics()` + sidecar /proc RSS，写 JSONL 遥测到 `logs/memory-watchdog.log`（512KB 轮转），任何子进程工作集超过 **6GB** 就地处置：gpu/utility SIGKILL（Chromium 自动重启），renderer 崩溃重载（保留窗口），browser/zygote/sidecar 只观测不杀。今后再发生直接能在遥测里看到元凶。
+- **renderer V8 堆上限**：`--js-flags=--max-old-space-size=4096`，失控页面 4GB 处封顶。
+- `OPENSCIENCE_NO_MEMORY_WATCHDOG=1` 可整体停用；11 个新测试覆盖决策与轮转。

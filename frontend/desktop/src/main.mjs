@@ -29,6 +29,7 @@ import { servicePort } from "./service-port.mjs"
 import { logsDirectory, rotateLogs } from "./log-path.mjs"
 import { readAppearance, resolveAppearance, saveAppearance, splashQuery, sweepAppearance } from "./appearance.mjs"
 import { createSshManager } from "./ssh-connections.mjs"
+import { createMemoryWatchdog, samplePidRss } from "./memory-watchdog.mjs"
 
 import { workspaceOrigin, workspaceHealth, workspaceNavigation } from "./remote-workspace.mjs"
 
@@ -44,6 +45,12 @@ if (process.platform === "linux") {
   )
   app.commandLine.appendSwitch("ozone-platform-hint", "auto")
 }
+
+// Renderer V8 heap ceiling: a runaway page hits a hard 4 GB limit instead of
+// dragging the whole machine into the swap spiral. The 2026-11-15 OOM
+// postmortem (memory-watchdog.mjs header) recorded one child at ~25 GB of
+// anonymous memory on a machine whose swap was already exhausted.
+app.commandLine.appendSwitch("js-flags", "--max-old-space-size=4096")
 
 const execute = promisify(execFile)
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..")
@@ -1329,6 +1336,30 @@ app
         userData: app.getPath("userData"),
       })
       if (logs) app.setAppLogsPath(logs)
+      // Memory watchdog: contains a runaway child before the machine enters
+      // the swap spiral, and leaves a per-process telemetry trail that names
+      // the culprit the next time the kernel OOM report does not.
+      if (!process.env.OPENSCIENCE_NO_MEMORY_WATCHDOG) {
+        const telemetryFile = path.join(logs ?? app.getPath("userData"), "memory-watchdog.log")
+        createMemoryWatchdog({
+          metrics: () => app.getAppMetrics(),
+          sidecarSample: () => ({ pid: state.service?.pid, rssMb: samplePidRss(state.service?.pid) }),
+          crashRenderer: (pid) => {
+            for (const window of windows) {
+              if (window.isDestroyed() || remoteWindows.has(window)) continue
+              if (window.webContents.getProcessId() === pid) {
+                window.webContents.forcefullyCrashRenderer()
+                window.webContents.reload()
+                return true
+              }
+            }
+            return false
+          },
+          kill: (pid) => process.kill(pid, "SIGKILL"),
+          write: (line) => appendFileSync(telemetryFile, line, { mode: 0o600 }),
+          rotate: () => rotateLogs(telemetryFile),
+        }).start()
+      }
       session.defaultSession.setPermissionRequestHandler((contents, permission, callback, details) => {
         // Gate on the requesting frame, not the top-level document: a cross-origin
         // iframe inside the local workspace page must not inherit its grants.
