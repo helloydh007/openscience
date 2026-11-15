@@ -171,7 +171,7 @@ function EditRow(props: EditRowProps) {
   )
 }
 
-type SSHStatus = "idle" | "connecting" | "uploading" | "connected" | "failed"
+type SSHStatus = "idle" | "connecting" | "syncing" | "uploading" | "connected" | "failed"
 
 const SSH_FORM_DEFAULTS = { label: "", host: "", user: "", port: "22", identityFile: "", remotePort: "4096" }
 
@@ -194,7 +194,7 @@ function sshEndpoint(connection: SSHConnectionRecord) {
 function sshStatusClass(value: SSHStatus) {
   if (value === "connected") return "bg-icon-success-base"
   if (value === "failed") return "bg-icon-critical-base"
-  if (value === "connecting" || value === "uploading") return "bg-icon-warning-base"
+  if (value === "connecting" || value === "syncing" || value === "uploading") return "bg-icon-warning-base"
   return "bg-border-weak-base"
 }
 
@@ -215,6 +215,8 @@ function SSHSection(props: SSHSectionProps) {
   const [showForm, setShowForm] = createSignal(false)
   const [busy, setBusy] = createSignal(false)
   let listGeneration = 0
+  let runtimeGeneration = 0
+  const [runtimeId, setRuntimeId] = createSignal<string | null>(null)
 
   const report = (title: string, error: unknown) => {
     showToast({
@@ -230,16 +232,35 @@ function SSHSection(props: SSHSectionProps) {
       const list = await props.ssh.list()
       if (generation !== listGeneration) return
       setConnections(list)
+      void refreshRuntime()
     } catch (error) {
       if (generation !== listGeneration) return
       report("SSH servers unavailable", error)
     }
   }
 
+  // The runtime badge mirrors main-process state: read it once on mount, then
+  // re-read whenever tunnel events land or the list refreshes.
+  const refreshRuntime = async () => {
+    const generation = ++runtimeGeneration
+    try {
+      const id = await props.ssh.runtime()
+      if (generation !== runtimeGeneration) return
+      setRuntimeId(id)
+    } catch {
+      // The badge is cosmetic; a failed read keeps the previous value.
+    }
+  }
+
   onMount(() => void refresh())
   // Events keep the per-connection dots current; dropping the subscription on
   // unmount keeps the bridge from holding renderer callbacks.
-  onCleanup(props.ssh.onEvent((event) => setStatus(event.connectionId, sshEventStatus(event.state))))
+  onCleanup(
+    props.ssh.onEvent((event) => {
+      setStatus(event.connectionId, sshEventStatus(event.state))
+      void refreshRuntime()
+    }),
+  )
 
   const importedCount = () => connections().filter((connection) => connection.origin === "ssh-config").length
 
@@ -286,13 +307,41 @@ function SSHSection(props: SSHSectionProps) {
     }
   }
 
+  // Connect (runtime mode) makes this connection back the main window: the
+  // main process switches the server behind this window, so the dialog stays
+  // open and the dots keep following the incoming tunnel events. The purpose
+  // must be spelled out — the main process only enters runtime mode on the
+  // literal "runtime", and anything else runs the old confirm-and-open-window
+  // flow.
   const handleConnect = async (connection: SSHConnectionRecord) => {
     if (busy()) return
     setBusy(true)
     try {
-      const result = await props.ssh.connect(connection.id)
+      const result = await props.ssh.connect(connection.id, "runtime")
       if (result.ok && result.url) {
-        // The main process opens the remote window; this dialog is done.
+        showToast({
+          variant: "success",
+          title: "Switched to remote runtime",
+          description: `The server behind the main window now uses ${connection.label}.`,
+        })
+        return
+      }
+      report("SSH connection failed", result.error ?? `Could not connect to ${connection.label}.`)
+    } catch (error) {
+      report("SSH connection failed", error)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  // Window mode keeps the old flow: the main process confirms and opens an
+  // isolated desktop window, so this dialog is done.
+  const handleConnectWindow = async (connection: SSHConnectionRecord) => {
+    if (busy()) return
+    setBusy(true)
+    try {
+      const result = await props.ssh.connect(connection.id, "window")
+      if (result.ok && result.url) {
         props.onClose()
         return
       }
@@ -377,13 +426,17 @@ function SSHSection(props: SSHSectionProps) {
           <For each={connections()}>
             {(connection) => {
               const state = () => status[connection.id] ?? "idle"
-              const active = () => state() === "connected" || state() === "connecting" || state() === "uploading"
+              const active = () =>
+                state() === "connected" || state() === "connecting" || state() === "syncing" || state() === "uploading"
               return (
                 <div class="server-dialog__ssh-row">
                   <div class={`server-dialog__status ${sshStatusClass(state())}`} />
                   <div class="server-dialog__ssh-identity">
                     <span class="server-dialog__ssh-label">
                       {connection.label}
+                      <Show when={runtimeId() === connection.id}>
+                        <span class="server-dialog__ssh-badge server-dialog__ssh-badge--runtime">Runtime</span>
+                      </Show>
                       <Show when={connection.origin === "ssh-config"}>
                         <span class="server-dialog__ssh-badge">~/.ssh/config</span>
                       </Show>
@@ -394,14 +447,24 @@ function SSHSection(props: SSHSectionProps) {
                     <Show
                       when={active()}
                       fallback={
-                        <Button
-                          size="small"
-                          variant="secondary"
-                          disabled={busy()}
-                          onClick={() => void handleConnect(connection)}
-                        >
-                          Connect
-                        </Button>
+                        <>
+                          <Button
+                            size="small"
+                            variant="secondary"
+                            disabled={busy()}
+                            onClick={() => void handleConnect(connection)}
+                          >
+                            Connect
+                          </Button>
+                          <Button
+                            size="small"
+                            variant="ghost"
+                            disabled={busy()}
+                            onClick={() => void handleConnectWindow(connection)}
+                          >
+                            Window
+                          </Button>
+                        </>
                       }
                     >
                       <Button

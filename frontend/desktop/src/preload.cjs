@@ -9,8 +9,15 @@ contextBridge.exposeInMainWorld("openscienceDesktop", {
     sync: () => ipcRenderer.invoke("openscience:ssh:sync"),
     save: (input) => ipcRenderer.invoke("openscience:ssh:save", input),
     remove: (id) => ipcRenderer.invoke("openscience:ssh:remove", id),
-    connect: (id) => ipcRenderer.invoke("openscience:ssh:connect", id),
+    connect: (id, purpose) => ipcRenderer.invoke("openscience:ssh:connect", id, purpose),
     disconnect: (id) => ipcRenderer.invoke("openscience:ssh:disconnect", id),
+    setRuntime: (id) => ipcRenderer.invoke("openscience:ssh:set-runtime", id),
+    runtime: () => ipcRenderer.invoke("openscience:ssh:runtime"),
+    onServerUse: (callback) => {
+      const listener = (_event, use) => callback(use)
+      ipcRenderer.on("openscience:server:use", listener)
+      return () => ipcRenderer.removeListener("openscience:server:use", listener)
+    },
     onEvent: (callback) => {
       const listener = (_event, event) => callback(event)
       ipcRenderer.on("openscience:ssh:event", listener)

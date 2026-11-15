@@ -40,7 +40,7 @@ interface SSHConnectionInput {
 
 interface SSHEvent {
   connectionId: string
-  state: "connecting" | "uploading" | "tunnel-up" | "closed" | "failed"
+  state: "connecting" | "syncing" | "uploading" | "tunnel-up" | "closed" | "failed"
   message?: string
 }
 
@@ -49,9 +49,15 @@ interface SSHBridge {
   sync(): Promise<{ imported: number; total: number }>
   save(input: SSHConnectionInput): Promise<SSHConnectionRecord>
   remove(id: string): Promise<void>
-  connect(id: string): Promise<{ ok: boolean; url?: string; error?: string }>
+  connect(id: string, purpose?: "runtime" | "window"): Promise<{ ok: boolean; url?: string; error?: string }>
   disconnect(id: string): Promise<void>
   onEvent(cb: (event: SSHEvent) => void): () => void
+  /** Runtime mode: make this connection back the main window's server. */
+  setRuntime(id: string | null): Promise<void>
+  /** The connection id currently powering the main window, or null for local. */
+  runtime(): Promise<string | null>
+  /** Fired when runtime mode switches the main window's backing server. */
+  onServerUse(cb: (event: { url: string; connectionId: string }) => void): () => void
 }
 
 interface Window {

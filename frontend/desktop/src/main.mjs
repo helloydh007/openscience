@@ -1076,6 +1076,18 @@ const sshManager = createSshManager({
   version: app.getVersion(),
 })
 sshManager.onEvent((event) => {
+  // A runtime tunnel that dies for good — retries exhausted, or a failed
+  // connect of its own — falls back to the local sidecar the same way an
+  // explicit disconnect does. Without this the workspace would keep aiming
+  // every request at a dead tunnel until the person reconnected by hand.
+  // The check is "still this selection", so a fallback cannot clobber a
+  // runtime the person picked meanwhile.
+  if (event.state === "failed" && sshManager.runtime() === event.connectionId) {
+    try {
+      sshManager.setRuntime(null)
+      pushServerUse(state.address, "")
+    } catch {}
+  }
   for (const window of windows) {
     if (!remoteWindows.has(window) && !window.isDestroyed()) window.webContents.send("openscience:ssh:event", event)
   }
@@ -1087,6 +1099,99 @@ function sshSender(event) {
     throw new Error("Only the local workspace can manage SSH connections")
   }
   return owner
+}
+
+/**
+ * Tells local windows which server the workspace runs on: a remote runtime's
+ * tunnel URL, or back to the local sidecar with an empty connection id. Local
+ * windows only — remote workspace windows have no preload and must never learn
+ * about SSH infrastructure — mirroring the ssh event fan-out above. The quit
+ * path never pushes: once exiting is set, windows are about to be destroyed.
+ */
+function pushServerUse(url, connectionId) {
+  if (state.exiting) return
+  for (const window of windows) {
+    if (!remoteWindows.has(window) && !window.isDestroyed()) {
+      window.webContents.send("openscience:server:use", { url, connectionId })
+    }
+  }
+}
+
+/**
+ * Widens connect-src on loopback-served pages so the workspace can reach a
+ * runtime tunnel. The switch happens while the page is already mounted: the
+ * sidecar's CSP header (`connect-src 'self'`, backend/cli/src/web/csp.ts) was
+ * fixed at load time, and the tunnel's port only exists once a connection is
+ * up, so the header must already allow any loopback origin for the in-place
+ * switch to work. Only connect-src grows, only over http/ws loopback — exactly
+ * the hosts an SSH tunnel may use (workspaceOrigin accepts no other HTTP) —
+ * and remote workspace windows are untouched: they run in their own
+ * persist:workspace-* partitions and keep their same-origin policy.
+ */
+function relaxLoopbackConnectSrc(url, headers) {
+  if (!headers || !URL.canParse(url)) return headers
+  const parsed = new URL(url)
+  if (parsed.protocol !== "http:" || !["127.0.0.1", "localhost", "[::1]"].includes(parsed.hostname)) return headers
+  const widened = {}
+  for (const [name, values] of Object.entries(headers)) {
+    widened[name] =
+      /^content-security-policy$/i.test(name) && Array.isArray(values)
+        ? values.map((value) =>
+            value.replace(/connect-src(\s+'self')/g, `connect-src$1 http://127.0.0.1:* ws://127.0.0.1:*`),
+          )
+        : values
+  }
+  return widened
+}
+
+/**
+ * The onTunnelUp hook for a runtime-mode connect: remember the selection for
+ * the next launch and switch every local window to the tunnel. No confirm and
+ * no new window. A record removed while connecting makes setRuntime throw, and
+ * connect reports that failure like any other.
+ *
+ * The restore path passes `restore: true`: while its tunnel is coming up —
+ * deploy and upload can take minutes — the person may have selected another
+ * runtime, and that fresher choice wins. The tunnel that arrives last then
+ * reports `false`, so connect tears it back down instead of switching every
+ * window back to a stale selection.
+ */
+function runtimeTunnelUp(id, { restore = false } = {}) {
+  return (url) => {
+    if (restore) {
+      const current = sshManager.runtime()
+      if (current !== null && current !== id) return false
+    }
+    sshManager.setRuntime(id)
+    pushServerUse(url, id)
+    return true
+  }
+}
+
+/**
+ * Restores the runtime connection the previous session selected. Called after
+ * the first window exists and never blocks startup: the tunnel comes up in the
+ * background and the workspace learns about it through openscience:server:use.
+ * A failed restore — for example a record deleted since — only clears the
+ * stale selection and reports one line on stderr; the workspace stays local.
+ */
+async function restoreRuntime() {
+  const id = sshManager.runtime()
+  if (!id) return
+  let result
+  try {
+    result = await sshManager.connect(id, { onTunnelUp: runtimeTunnelUp(id, { restore: true }) })
+  } catch (error) {
+    result = { ok: false, error: error instanceof Error ? error.message : String(error) }
+  }
+  if (result?.ok) return
+  try {
+    // Only clear the selection this restore owns, so a choice made meanwhile wins.
+    if (sshManager.runtime() === id) sshManager.setRuntime(null)
+  } catch {}
+  process.stderr.write(
+    `[openscience] The runtime SSH connection ${id} was not restored: ${String(result?.error ?? "unknown reason").replace(/\s*\r?\n\s*/g, " ")}\n`,
+  )
 }
 
 ipcMain.handle("openscience:ssh:list", (event) => {
@@ -1104,18 +1209,47 @@ ipcMain.handle("openscience:ssh:save", (event, input) => {
   return sshManager.save(input)
 })
 
-ipcMain.handle("openscience:ssh:remove", (event, id) => {
+ipcMain.handle("openscience:ssh:remove", async (event, id) => {
   sshSender(event)
-  return sshManager.remove(id)
+  await sshManager.remove(id)
+  // The removed connection was the selected runtime: fall back to the local
+  // server. setRuntime(null) persists only; the workspace learns of the
+  // switch through the broadcast below.
+  if (sshManager.runtime() === id) {
+    sshManager.setRuntime(null)
+    pushServerUse(state.address, "")
+  }
 })
 
-ipcMain.handle("openscience:ssh:disconnect", (event, id) => {
+ipcMain.handle("openscience:ssh:disconnect", async (event, id) => {
   sshSender(event)
-  return sshManager.disconnect(id)
+  await sshManager.disconnect(id)
+  // Same fallback as remove: a disconnected runtime leaves the workspace local.
+  if (sshManager.runtime() === id) {
+    sshManager.setRuntime(null)
+    pushServerUse(state.address, "")
+  }
 })
 
-ipcMain.handle("openscience:ssh:connect", async (event, id) => {
+ipcMain.handle("openscience:ssh:set-runtime", (event, id) => {
+  sshSender(event)
+  sshManager.setRuntime(id)
+})
+
+ipcMain.handle("openscience:ssh:runtime", (event) => {
+  sshSender(event)
+  return sshManager.runtime()
+})
+
+ipcMain.handle("openscience:ssh:connect", async (event, id, purpose) => {
   const owner = sshSender(event)
+  // Runtime mode: this connection becomes the workspace's own server. No
+  // confirm and no new window — the selection is remembered for the next
+  // launch and every local window switches to the tunnel through
+  // openscience:server:use.
+  if (purpose === "runtime") {
+    return sshManager.connect(id, { onTunnelUp: runtimeTunnelUp(id) })
+  }
   return sshManager.connect(id, {
     // The tunnel is up; the workspace window opens only once the person
     // confirms, and cancelling tears the tunnel back down. Mirrors the
@@ -1200,6 +1334,11 @@ app
         // iframe inside the local workspace page must not inherit its grants.
         callback(permissions.has(permission) && localNavigation(details?.requestingUrl || contents.getURL()))
       })
+      // Registered before the first window loads, so a workspace page mounted
+      // before any runtime was selected is already allowed to reach one.
+      session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
+        callback({ responseHeaders: relaxLoopbackConnectSrc(details.url, details.responseHeaders) })
+      })
       if (app.isPackaged && process.platform === "darwin") {
         state.updateCache = path.join(app.getPath("userData"), "updates")
         mkdirSync(state.updateCache, { recursive: true, mode: 0o700 })
@@ -1242,6 +1381,9 @@ app
       }
       await start()
       await createWindow()
+      // The first window is up; the previous session's runtime connection is
+      // restored in the background so startup never waits on an SSH tunnel.
+      void restoreRuntime()
       await acknowledgeUpdateHealth()
       splash.destroy()
     } catch (error) {

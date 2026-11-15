@@ -278,6 +278,18 @@ export const { use: useServer, provider: ServerProvider } = createSimpleContext(
       setState("active", url)
     })
 
+    // Runtime mode: the desktop main process pushes a server-use event when an
+    // SSH tunnel starts backing the main window. The bridge is undefined outside
+    // Electron, so the subscription simply never registers there. add() is a
+    // stable closure and reads live store state, so the callback stays current;
+    // it normalizes the URL and skips duplicates itself.
+    createEffect(() => {
+      const bridge = platform.ssh
+      if (!bridge) return
+      const unsubscribe = bridge.onServerUse((event) => add(event.url, true))
+      onCleanup(unsubscribe)
+    })
+
     const isReady = createMemo(() => ready() && !!state.active)
 
     const check = (url: string) => {

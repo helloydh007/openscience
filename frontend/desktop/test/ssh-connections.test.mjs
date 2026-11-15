@@ -1,6 +1,16 @@
 import { afterEach, beforeAll, describe, expect, test } from "bun:test"
 import { createHash } from "node:crypto"
-import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs"
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import {
@@ -17,9 +27,17 @@ import {
 // The fake ssh answers every remote command the state machine runs and records
 // each invocation in a log the tests read back. The tunnel (recognized by its
 // ExitOnForwardFailure option) stays alive on `exec sleep` until the manager
-// kills it, so the happy path never trips the reconnect machinery.
+// kills it, so the happy path never trips the reconnect machinery. Extension
+// sync commands (tar -C … -xf -) are executed for real: stdin is written to a
+// temp file, the `-xf -` in the remote command is swapped for that file, and
+// the whole command is evaluated as written — with $HOME pinned to the fixture
+// root — so synced fixtures really land in the fake remote tree, including the
+// staging swap the replace item performs.
 const fakeSshScript = `#!/usr/bin/env bash
 log="\${FAKE_SSH_LOG}"
+# The remote layout is anchored at the SSH user's home, so the fake remote
+# pins $HOME to the fixture root before evaluating any remote command.
+if [ -n "\${FAKE_SSH_HOME:-}" ]; then export HOME="\${FAKE_SSH_HOME}"; fi
 all="$*"
 cmd="\${*: -1}"
 if [[ "$all" == *"ExitOnForwardFailure"* ]]; then
@@ -62,6 +80,29 @@ case "$cmd" in
     printf '%s' "\${FAKE_SSH_LISTEN:-}"
     exit 0
     ;;
+  "rm -rf "*|*"tar -C "*)
+    if [ -n "\${FAKE_SSH_SYNC_EXIT:-}" ]; then exit "\${FAKE_SSH_SYNC_EXIT}"; fi
+    if [[ "$cmd" == *" -xf -"* ]]; then
+      tmpfile="\$(mktemp "\${TMPDIR:-/tmp}/fake-ssh-sync.XXXXXX")"
+      cat > "$tmpfile"
+      archive="$tmpfile"
+      # A failing replace item exercises the staging swap: the archive is
+      # unreadable, so tar fails after staging and the real destination must
+      # survive untouched.
+      if [ -n "\${FAKE_SSH_REPLACE_TAR_EXIT:-}" ] && [[ "$cmd" == *".sync-staging"* ]]; then
+        archive="/nonexistent/fake-ssh-missing-archive.tar"
+      fi
+      # The command is evaluated as written, with only the tar stream swapped
+      # for the captured stdin, so the manager's quoting and the $HOME
+      # anchoring are exercised exactly as a real remote shell would.
+      eval "\${cmd/ -xf -/ -xf '$archive'}"
+      rc=\$?
+      rm -f "$tmpfile"
+      if [ \$rc -eq 0 ]; then printf '%s\\n' "sync: $cmd" >> "$log"; fi
+      exit \$rc
+    fi
+    exit 0
+    ;;
   "cat > "*) bytes=\$(wc -c); printf '%s\\n' "upload: $bytes" >> "$log"; exit 0 ;;
   curl*) exit 1 ;;
   tail*) printf 'FATAL: listen tcp 127.0.0.1:4096: bind: address already in use\\n' ;;
@@ -86,12 +127,17 @@ function setup({ probe, healthDeadlineMs = 1_000, sshConfig } = {}) {
   process.env.FAKE_SSH_LOG = path.join(dir, "fake-ssh.log")
   process.env.FAKE_SSH_STATE = path.join(dir, "fake-ssh-state")
   process.env.FAKE_SSH_DIGEST = digest
+  // The fake remote's home is the fixture root, so remote commands anchored at
+  // $HOME unpack inside the same tree the assertions read back.
+  process.env.FAKE_SSH_HOME = dir
   delete process.env.FAKE_SSH_PROBE_EXIT
   delete process.env.FAKE_SSH_VERSION
   delete process.env.FAKE_SSH_BUILD
   delete process.env.FAKE_SSH_FOREIGN
   delete process.env.FAKE_SSH_FOREIGN_PORT
   delete process.env.FAKE_SSH_LISTEN
+  delete process.env.FAKE_SSH_SYNC_EXIT
+  delete process.env.FAKE_SSH_REPLACE_TAR_EXIT
   const manager = createSshManager({
     userData: dir,
     sidecarPath: sidecar,
@@ -107,7 +153,15 @@ function setup({ probe, healthDeadlineMs = 1_000, sshConfig } = {}) {
     manager.stopAll()
     rmSync(dir, { recursive: true, force: true })
   })
-  return { dir, manager, digest, log: () => readFileSync(process.env.FAKE_SSH_LOG, "utf8") }
+  return {
+    dir,
+    manager,
+    digest,
+    log: () => readFileSync(process.env.FAKE_SSH_LOG, "utf8"),
+    // Exposed so a test can build a second manager over the same store.
+    sshPath: script,
+    sidecarPath: sidecar,
+  }
 }
 
 // The tunnel child logs its invocation a few milliseconds after the connect
@@ -133,9 +187,12 @@ afterEach(() => {
   delete process.env.FAKE_SSH_VERSION
   delete process.env.FAKE_SSH_BUILD
   delete process.env.FAKE_SSH_DIGEST
+  delete process.env.FAKE_SSH_HOME
   delete process.env.FAKE_SSH_FOREIGN
   delete process.env.FAKE_SSH_FOREIGN_PORT
   delete process.env.FAKE_SSH_LISTEN
+  delete process.env.FAKE_SSH_SYNC_EXIT
+  delete process.env.FAKE_SSH_REPLACE_TAR_EXIT
 })
 
 describe("connection validation", () => {
@@ -564,7 +621,10 @@ describe("connect state machine", () => {
     const result = await manager.connect(saved.id)
     expect(result.ok).toBe(true)
     expect(result.url).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/)
-    expect(events.map((event) => event.state)).toEqual(["connecting", "uploading", "tunnel-up"])
+    // The sync phase always runs after deploy (whose own upload event precedes
+    // it) and before the tunnel, even when the fixture home has no local
+    // extensions to mirror.
+    expect(events.map((event) => event.state)).toEqual(["connecting", "uploading", "syncing", "tunnel-up"])
     expect(events.every((event) => event.connectionId === saved.id)).toBe(true)
     await waitForLog(log, "tunnel:")
     const text = log()
@@ -654,7 +714,7 @@ describe("connect state machine", () => {
     const saved = manager.save({ label: "Lab", host: "lab.example.com", remotePort: 4096 })
     const result = await manager.connect(saved.id)
     expect(result.ok).toBe(true)
-    expect(events.map((event) => event.state)).toEqual(["connecting", "tunnel-up"])
+    expect(events.map((event) => event.state)).toEqual(["connecting", "syncing", "tunnel-up"])
     const text = log()
     expect(text).not.toContain("upload:")
     expect(text).not.toContain("cmd: mv ~/.openscience")
@@ -718,5 +778,228 @@ describe("connect state machine", () => {
     expect(result.error).toContain("FATAL: listen tcp 127.0.0.1:4096")
     expect(events.at(-1)?.state).toBe("failed")
     expect(log()).toContain("tail -c 2000 ~/.openscience/remote/server.log")
+  })
+})
+
+describe("runtime selection", () => {
+  test("setRuntime validates, persists, never emits, and survives a reload", () => {
+    const { dir, manager, sshPath, sidecarPath } = setup()
+    expect(manager.runtime()).toBe(null)
+    const events = []
+    manager.onEvent((event) => events.push(event))
+    const saved = manager.save({ label: "Lab", host: "lab.example.com", remotePort: 4096 })
+    manager.setRuntime(saved.id)
+    expect(manager.runtime()).toBe(saved.id)
+    // The selection is silent: the workspace learns about it over IPC, not
+    // through the ssh event bus.
+    expect(events).toEqual([])
+    const stored = JSON.parse(readFileSync(path.join(dir, "ssh-connections.json"), "utf8"))
+    expect(stored.runtime).toBe(saved.id)
+    // A fresh manager over the same store keeps the selection.
+    const reloaded = createSshManager({
+      userData: dir,
+      sidecarPath,
+      version: "9.9.9",
+      sshExecutable: sshPath,
+      probe: async () => true,
+      sshConfigPath: path.join(dir, "ssh-config"),
+      homeDir: dir,
+    })
+    reloaded.stopAll()
+    expect(reloaded.runtime()).toBe(saved.id)
+    // Clearing persists too: the field is dropped so nothing is resurrected.
+    manager.setRuntime(null)
+    expect(manager.runtime()).toBe(null)
+    const cleared = JSON.parse(readFileSync(path.join(dir, "ssh-connections.json"), "utf8"))
+    expect("runtime" in cleared).toBe(false)
+  })
+
+  test("setRuntime rejects ids that are not in the current list", () => {
+    const { manager } = setup()
+    expect(() => manager.setRuntime("missing")).toThrow("No SSH connection has id missing")
+    const saved = manager.save({ label: "Lab", host: "lab.example.com", remotePort: 4096 })
+    manager.setRuntime(saved.id)
+    expect(() => manager.setRuntime("sshconfig:ghost")).toThrow("No SSH connection has id sshconfig:ghost")
+    expect(manager.runtime()).toBe(saved.id)
+  })
+
+  test("an imported alias can become the runtime", () => {
+    const { manager } = setup({ sshConfig: `Host lab\n  HostName 10.0.0.9\n` })
+    manager.setRuntime("sshconfig:lab")
+    expect(manager.runtime()).toBe("sshconfig:lab")
+  })
+
+  test("record edits keep the stored runtime selection", () => {
+    const { dir, manager } = setup()
+    const saved = manager.save({ label: "Lab", host: "lab.example.com", remotePort: 4096 })
+    manager.setRuntime(saved.id)
+    manager.save({ ...saved, label: "Renamed" })
+    expect(manager.runtime()).toBe(saved.id)
+    const stored = JSON.parse(readFileSync(path.join(dir, "ssh-connections.json"), "utf8"))
+    expect(stored.runtime).toBe(saved.id)
+    expect(stored.connections[0].label).toBe("Renamed")
+  })
+})
+
+describe("local extension sync", () => {
+  // Seeds the local side of the sync items inside the fixture home, plus stale
+  // remote state the sync has to overwrite (a merged file) or wipe (the
+  // replaced config root).
+  function seedHome(dir) {
+    const write = (relative, content) => {
+      const target = path.join(dir, relative)
+      mkdirSync(path.dirname(target), { recursive: true })
+      writeFileSync(target, content)
+    }
+    write(".openscience/user-skills/lab-skill/SKILL.md", "local lab skill\n")
+    write(".openscience/installed-skills/pkg/installed/SKILL.md", "installed skill\n")
+    write(".claude/skills/claude-skill/SKILL.md", "claude skill\n")
+    write(".config/openscience/settings.json", '{"local":true}\n')
+    write(".openscience/auth.json", '{"token":"fresh"}\n')
+    write(".openscience/credentials.key", "key-bytes\n")
+    write(".openscience/remote/data/auth.json", '{"token":"stale"}\n')
+    write(".openscience/remote/data/user-skills/remote-only/SKILL.md", "remote only\n")
+    write(".openscience/remote/config/openscience/stale.txt", "stale config\n")
+  }
+
+  test("connect mirrors local skills, credentials and config into the remote roots", async () => {
+    const { dir, manager, log } = setup()
+    seedHome(dir)
+    const saved = manager.save({ label: "Lab", host: "lab.example.com", remotePort: 4096 })
+    const result = await manager.connect(saved.id)
+    expect(result.ok).toBe(true)
+    await waitForLog(log, "sync:")
+    // Merged skill directories land under the remote data root, and a skill
+    // that only exists on the remote survives the merge.
+    expect(
+      readFileSync(path.join(dir, ".openscience", "remote", "data", "user-skills", "lab-skill", "SKILL.md"), "utf8"),
+    ).toBe("local lab skill\n")
+    expect(
+      readFileSync(
+        path.join(dir, ".openscience", "remote", "data", "installed-skills", "pkg", "installed", "SKILL.md"),
+        "utf8",
+      ),
+    ).toBe("installed skill\n")
+    expect(
+      readFileSync(path.join(dir, ".openscience", "remote", "data", "user-skills", "remote-only", "SKILL.md"), "utf8"),
+    ).toBe("remote only\n")
+    // Single files are overwritten in place.
+    expect(readFileSync(path.join(dir, ".openscience", "remote", "data", "auth.json"), "utf8")).toBe(
+      '{"token":"fresh"}\n',
+    )
+    expect(readFileSync(path.join(dir, ".openscience", "remote", "data", "credentials.key"), "utf8")).toBe(
+      "key-bytes\n",
+    )
+    // The .claude skills mirror into their unchanged location.
+    expect(readFileSync(path.join(dir, ".claude", "skills", "claude-skill", "SKILL.md"), "utf8")).toBe("claude skill\n")
+    // The replace item wiped the remote config root and re-created the app's
+    // config directory (XDG_CONFIG_HOME + "openscience") from the local one.
+    expect(
+      readFileSync(path.join(dir, ".openscience", "remote", "config", "openscience", "settings.json"), "utf8"),
+    ).toBe('{"local":true}\n')
+    expect(existsSync(path.join(dir, ".openscience", "remote", "config", "openscience", "stale.txt"))).toBe(false)
+    const text = log()
+    // Exactly the items whose local side exists were synced; the replace
+    // command stages the fresh config beside the real one and only swaps it in
+    // after the tar stream has landed, and the merge ones only create the
+    // parent.
+    expect((text.match(/sync: /g) ?? []).length).toBe(6)
+    expect(text).toMatch(
+      /cmd: mkdir -p "\$HOME\/"'\.openscience\/remote' && rm -rf "\$HOME\/"'\.openscience\/remote\/config\.sync-staging'/,
+    )
+    expect(text).toMatch(
+      /tar -C "\$HOME\/"'\.openscience\/remote\/config\.sync-staging' -xf - && rm -rf "\$HOME\/"'\.openscience\/remote\/config' && mv/,
+    )
+    // Remote paths are anchored at the remote $HOME, never at the local home's
+    // absolute spelling, which only matches when both homes are identical.
+    expect(text).toContain(
+      "cmd: mkdir -p \"$HOME/\"'.openscience/remote/data' && tar -C \"$HOME/\"'.openscience/remote/data' -xf -",
+    )
+    expect(text).not.toMatch(/'(\/|[A-Za-z]:\\)[^']*openscience\/remote\/data/)
+    // No remote command line may carry the local home at all.
+    expect(text).not.toContain(dir)
+    expect(text).not.toContain("credentials.json")
+    expect(text).not.toContain("mcp-auth.json")
+    expect(text).not.toContain("compute.key")
+    expect(text).not.toContain("settings-compute.json")
+    await manager.disconnect(saved.id)
+  })
+
+  test("a failed replace item leaves the remote config root and the local items untouched", async () => {
+    const { dir, manager, log } = setup()
+    seedHome(dir)
+    // The replace item's tar fails mid-transfer: the staging swap means the
+    // running server's config root must survive, and no staging leftovers stay
+    // behind.
+    process.env.FAKE_SSH_REPLACE_TAR_EXIT = "2"
+    const saved = manager.save({ label: "Lab", host: "lab.example.com", remotePort: 4096 })
+    const events = []
+    manager.onEvent((event) => events.push(event))
+    const result = await manager.connect(saved.id)
+    expect(result.ok).toBe(true)
+    await waitForLog(log, "tunnel:")
+    // The stale remote config root is exactly as the sync found it.
+    expect(readFileSync(path.join(dir, ".openscience", "remote", "config", "openscience", "stale.txt"), "utf8")).toBe(
+      "stale config\n",
+    )
+    // The failed attempt cleaned up its staging directory.
+    expect(existsSync(path.join(dir, ".openscience", "remote", "config.sync-staging"))).toBe(false)
+    // The first failure stops the remaining items: nothing after the replace
+    // item was synced.
+    expect(readFileSync(path.join(dir, ".openscience", "remote", "data", "auth.json"), "utf8")).toBe(
+      '{"token":"stale"}\n',
+    )
+    const skipped = events.find(
+      (event) => event.state === "syncing" && event.message?.includes("Local extension sync skipped:"),
+    )
+    expect(skipped).toBeDefined()
+    // Only the three merge items ahead of the replace item made it through.
+    expect((log().match(/sync: /g) ?? []).length).toBe(3)
+    await manager.disconnect(saved.id)
+  })
+
+  test("connect reports the syncing phase between deploy and the tunnel", async () => {
+    const { dir, manager } = setup()
+    seedHome(dir)
+    const saved = manager.save({ label: "Lab", host: "lab.example.com", remotePort: 4096 })
+    const events = []
+    manager.onEvent((event) => events.push(event))
+    expect((await manager.connect(saved.id)).ok).toBe(true)
+    expect(events.map((event) => event.state)).toEqual(["connecting", "uploading", "syncing", "tunnel-up"])
+    const syncing = events.find((event) => event.state === "syncing")
+    expect(syncing.connectionId).toBe(saved.id)
+    expect(syncing.message).toBe("Syncing local skills, plugins and config to lab.example.com")
+    await manager.disconnect(saved.id)
+  })
+
+  test("a failed sync is soft: connect still succeeds and the event explains the skip", async () => {
+    const { dir, manager, log } = setup()
+    seedHome(dir)
+    process.env.FAKE_SSH_SYNC_EXIT = "9"
+    const saved = manager.save({ label: "Lab", host: "lab.example.com", remotePort: 4096 })
+    const events = []
+    manager.onEvent((event) => events.push(event))
+    const result = await manager.connect(saved.id)
+    expect(result.ok).toBe(true)
+    expect(result.url).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/)
+    await waitForLog(log, "tunnel:")
+    const skipped = events.find(
+      (event) => event.state === "syncing" && event.message?.includes("Local extension sync skipped:"),
+    )
+    expect(skipped).toBeDefined()
+    expect(skipped.connectionId).toBe(saved.id)
+    // The skip message carries the underlying ssh failure.
+    expect(skipped.message).toContain("Syncing")
+    expect(skipped.message).toContain("exited with code 9")
+    // Nothing was unpacked: the stale remote state is untouched, and the
+    // first failure stops the remaining items.
+    expect(readFileSync(path.join(dir, ".openscience", "remote", "data", "auth.json"), "utf8")).toBe(
+      '{"token":"stale"}\n',
+    )
+    expect(readFileSync(path.join(dir, ".openscience", "remote", "config", "openscience", "stale.txt"), "utf8")).toBe(
+      "stale config\n",
+    )
+    expect((log().match(/sync: /g) ?? []).length).toBe(0)
+    await manager.disconnect(saved.id)
   })
 })

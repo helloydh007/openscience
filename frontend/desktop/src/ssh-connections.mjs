@@ -14,6 +14,8 @@ import { createServer } from "node:net"
 import os from "node:os"
 import path from "node:path"
 
+import { extensionSyncItems } from "./remote-sync.mjs"
+
 // Managed SSH connections for the desktop shell: stored records, remote
 // sidecar deployment, a loopback-only tunnel, and the health gate the remote
 // workspace window opens behind. Nothing here imports Electron; main.mjs
@@ -48,6 +50,18 @@ const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 /** Wraps a value for safe interpolation into a remote shell command string. */
 export function shq(value) {
   return `'${String(value).replaceAll("'", `'\\''`)}'`
+}
+
+/**
+ * A remote path anchored at the SSH user's home directory. Extension sync
+ * targets are stored relative to that home (see remote-sync.mjs): the deployed
+ * server reads $HOME-derived OPENSCIENCE_DATA_DIR and XDG_CONFIG_HOME, so the
+ * command must expand the remote $HOME, never borrow the local home's absolute
+ * spelling. The double-quoted prefix expands; the shq() tail keeps any path
+ * the caller hands over literal.
+ */
+export function remoteHomePath(relative) {
+  return `"$HOME/"${shq(relative)}`
 }
 
 /**
@@ -427,7 +441,11 @@ function runProcess(command, args, { timeoutMs, stdin } = {}) {
 
 function execFailure(result, action) {
   if (result.spawnError) return `${action} failed: ${result.spawnError.message}`
-  const reason = result.timedOut ? "timed out" : `exited with code ${result.code}`
+  const reason = result.timedOut
+    ? "timed out"
+    : result.signal
+      ? `was terminated by ${result.signal}`
+      : `exited with code ${result.code}`
   const detail = result.stderr.trim()
   return `${action} failed (${reason})${detail ? `: ${detail}` : ""}`
 }
@@ -512,13 +530,20 @@ export function createSshManager({
     // corruption the records cannot be recovered from, so it also reads as
     // empty — which is safe only because persist() moves a store it cannot
     // read aside before overwriting it, so an empty read can never erase data.
+    // The selected runtime is optional: stores written before the runtime
+    // feature omit the field, and a malformed one reads as "none selected".
     try {
       const stored = JSON.parse(readFileSync(file, "utf8"))
-      if (stored?.version === 1 && Array.isArray(stored.connections)) return stored.connections
+      if (stored?.version === 1 && Array.isArray(stored.connections)) {
+        return {
+          connections: stored.connections,
+          runtime: typeof stored.runtime === "string" && stored.runtime ? stored.runtime : null,
+        }
+      }
     } catch (error) {
-      if (error?.code === "ENOENT") return []
+      if (error?.code === "ENOENT") return { connections: [], runtime: null }
     }
-    return []
+    return { connections: [], runtime: null }
   }
 
   /**
@@ -552,13 +577,21 @@ export function createSshManager({
     renameSync(file, target)
   }
 
-  function persist(connections) {
+  function persist(connections, runtime) {
     mkdirSync(userData, { recursive: true })
     // Never let a write destroy content the records could not be read from.
     preserveUnreadableStore()
+    // The selected runtime rides along on every save; only setRuntime passes
+    // an explicit one, so record edits never drop the selection, and a null
+    // one is stored as an absent field rather than an empty value.
+    const carried = runtime === undefined ? load().runtime : runtime
     // Owner-only: the file inventories hosts, users, and identity paths —
     // secrets-adjacent even though no credentials are ever stored.
-    writeFileSync(file, `${JSON.stringify({ version: 1, connections }, null, 2)}\n`, { mode: 0o600 })
+    writeFileSync(
+      file,
+      `${JSON.stringify({ version: 1, connections, ...(carried ? { runtime: carried } : {}) }, null, 2)}\n`,
+      { mode: 0o600 },
+    )
   }
 
   function onEvent(listener) {
@@ -579,7 +612,7 @@ export function createSshManager({
    * of truth and an edit here would be overwritten by the next import.
    */
   function derived() {
-    const stored = load()
+    const stored = load().connections
     const manual = stored.filter((connection) => connection.origin !== SSH_CONFIG_ORIGIN)
     const prior = new Map(
       stored
@@ -608,7 +641,7 @@ export function createSshManager({
   /** Persists the current import; the dialog's Sync button calls this. */
   function sync() {
     const { all, imported } = derived()
-    if (JSON.stringify(all) !== JSON.stringify(load())) persist(all)
+    if (JSON.stringify(all) !== JSON.stringify(load().connections)) persist(all)
     return { imported: imported.length, total: all.length }
   }
 
@@ -645,6 +678,91 @@ export function createSshManager({
     const result = await runProcess(sshExecutable, args, { timeoutMs: UPLOAD_TIMEOUT_MS, stdin: stream })
     stream.destroy()
     if (result.code !== 0) throw new Error(execFailure(result, action))
+  }
+
+  /**
+   * Packs one sync item with a local tar and returns the archive stream for
+   * ssh's stdin together with the pack's own outcome. Same guarantees as
+   * runProcess: an argv array (never a local shell), a hard timeout with a
+   * SIGTERM backstop, bounded stderr capture, and a settle on close so status
+   * and output always arrive together.
+   */
+  function packItem(item) {
+    const child = spawn("tar", ["-C", path.dirname(item.local), "-cf", "-", path.basename(item.local)], {
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+    })
+    let stderr = ""
+    let timedOut = false
+    const timer = setTimeout(() => {
+      timedOut = true
+      child.kill("SIGTERM")
+    }, UPLOAD_TIMEOUT_MS)
+    timer.unref?.()
+    child.stderr?.on("data", (chunk) => {
+      stderr = stderr.length < OUTPUT_CAP ? stderr + chunk.toString("utf8") : stderr
+    })
+    const settled = new Promise((resolve) => {
+      let done = false
+      const finish = (code, signal, spawnError) => {
+        if (done) return
+        done = true
+        clearTimeout(timer)
+        resolve({ code, signal, stderr, timedOut, spawnError })
+      }
+      child.on("error", (error) => finish(undefined, undefined, error))
+      child.on("close", (code, signal) => finish(code, signal))
+    })
+    return { stdout: child.stdout, settled }
+  }
+
+  /**
+   * Mirrors the local extension state into the remote runtime: skills merge,
+   * credentials land beside the remote server's data, and the desktop's config
+   * replaces the remote config root. Each item is packed locally with tar from
+   * an argv array and streamed through ssh stdin to a remote `tar -xf -`;
+   * every interpolated path goes through remoteHomePath(), which anchors at the
+   * remote $HOME. Merge items are extracted into the destination's parent so
+   * the tar entry recreates it without touching anything already there. The
+   * replace item never wipes its destination until the fresh copy has been
+   * fully extracted into a staging sibling and only then moves it into place:
+   * an interrupted transfer must leave the running server's config root whole,
+   * and the trailing rm clears whatever staging directory a failed attempt
+   * left behind. A failure propagates: connect() is the one that softens it
+   * into a skipped-sync event.
+   */
+  async function syncExtensions(record) {
+    for (const item of extensionSyncItems(homeDir)) {
+      const target = sshTarget(record)
+      // Directory items recreate their own basename, so merges extract into the
+      // destination's parent directory; the replace item extracts into a
+      // staging sibling and only then moves over the destination.
+      const parent = remoteHomePath(path.posix.dirname(item.remote))
+      const destination = item.replace ? remoteHomePath(item.remote) : parent
+      const staged = remoteHomePath(`${item.remote}.sync-staging`)
+      // The trailing cleanup clears whatever staging directory a failed
+      // attempt left behind and then reports the failure: a bare
+      // `|| rm -rf ...` would succeed and mask the broken transfer.
+      const command = item.replace
+        ? `${[
+            `mkdir -p ${parent}`,
+            `rm -rf ${staged}`,
+            `mkdir -p ${staged}`,
+            `tar -C ${staged} -xf -`,
+            `rm -rf ${destination}`,
+            `mv ${staged} ${destination}`,
+          ].join(" && ")} || { rm -rf ${staged}; exit 1; }`
+        : `mkdir -p ${destination} && tar -C ${destination} -xf -`
+      const action = `Syncing ${item.local} to ${target}`
+      const packed = packItem(item)
+      const result = await runProcess(sshExecutable, [...sshBaseArgs(record), target, command], {
+        timeoutMs: UPLOAD_TIMEOUT_MS,
+        stdin: packed.stdout,
+      })
+      const pack = await packed.settled
+      if (result.spawnError || result.code !== 0) throw new Error(execFailure(result, action))
+      if (pack.spawnError || pack.code !== 0) throw new Error(execFailure(pack, action))
+    }
   }
 
   // The sidecar this desktop ships is the local, telemetry-free build. Its
@@ -1027,6 +1145,24 @@ export function createSshManager({
       // deploy() may move the server to a free remote port when the configured
       // one is occupied by a server this desktop did not deploy.
       session.connection = await deploy(record)
+      // Extension sync mirrors local skills, plugins and config into the
+      // remote runtime. It is a convenience, not a precondition: anything that
+      // goes wrong is reported through the syncing event and the connect
+      // continues to the tunnel.
+      try {
+        emit({
+          connectionId: id,
+          state: "syncing",
+          message: `Syncing local skills, plugins and config to ${sshTarget(session.connection)}`,
+        })
+        await syncExtensions(session.connection)
+      } catch (error) {
+        emit({
+          connectionId: id,
+          state: "syncing",
+          message: `Local extension sync skipped: ${error instanceof Error ? error.message : String(error)}`,
+        })
+      }
       if (!(await openTunnel(session))) {
         const tail = await remoteLogTail(session.connection)
         const cause = session.tunnelExit
@@ -1081,5 +1217,26 @@ export function createSshManager({
     }
   }
 
-  return { list, sync, save, remove, connect, disconnect, stopAll, onEvent }
+  /**
+   * The connection the desktop treats as the workspace runtime. Reading the
+   * store fresh keeps it consistent with list(); selecting one validates
+   * against the current list, persists for the next launch, and never emits an
+   * event — the runtime switch is announced over IPC, not through the ssh
+   * event bus. A dangling id (its record was removed elsewhere) is tolerated
+   * on read; the connect flow reports it as any other missing id.
+   */
+  function runtime() {
+    return load().runtime
+  }
+
+  function setRuntime(id) {
+    if (id === null) {
+      persist(list(), null)
+      return
+    }
+    if (!list().some((connection) => connection.id === id)) throw new Error(`No SSH connection has id ${id}`)
+    persist(list(), id)
+  }
+
+  return { list, sync, save, remove, connect, disconnect, stopAll, onEvent, runtime, setRuntime }
 }

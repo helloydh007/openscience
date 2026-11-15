@@ -352,11 +352,23 @@
   vertical-align: 1px;
 }
 
+/* Marks the SSH connection currently backing the main window in runtime mode. */
+.server-dialog__ssh-badge--runtime {
+  background: color-mix(in srgb, var(--color-icon-success) 14%, var(--color-surface-raised));
+  color: var(--color-text-secondary);
+}
+
 .server-dialog__ssh-actions {
   display: flex;
   flex: 0 0 auto;
   align-items: center;
   gap: 4px;
+}
+
+/* Rows can carry three buttons now (Connect/Window/Remove); give the trailing
+   one a touch more separation so the group stays readable at 560px. */
+.server-dialog__ssh-actions > :nth-child(n + 3) {
+  margin-left: 2px;
 }
 
 .server-dialog__ssh-empty {

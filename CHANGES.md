@@ -461,3 +461,44 @@ authorization: Bearer test-key
 - 新增 2 个用例（占用时切端口 + 复用已选端口不重启），并断言启动命令带隔离的数据根；桌面测试 39 pass。
 
 实测 `agentbox`：连接提示 `Port 4096 … already used by another OpenScience (2.0.153); using port 4097` → 启动本构建 → 隧道健康 `2.0.153-local.1` → 远端窗口直接进入 Projects 页（截图与 DOM 文本均无登录）。远端 4097 上的 server 保留运行，连接记录已记住 4097。
+
+---
+
+# 第四轮改造：ZCode 式远程运行时与本地扩展同步（2026-11-14）
+
+在第三轮的 SSH 连接管理器之上，把远程主机从"多开一个独立窗口"升级为"主窗口背后的运行时"，并让每次连接自动把本地扩展状态镜像到远端。改动：`frontend/desktop/src/remote-sync.mjs`（新增）、`frontend/desktop/src/{main.mjs,preload.cjs,ssh-connections.mjs}`、`frontend/workspace/src/{components/dialog-select-server.tsx,components/dialog-select-server.css,context/server.tsx,env.d.ts}`；测试 `frontend/desktop/test/{ssh-connections,remote-sync}.test.mjs`。用户文档见 `docs/local-first/remote-runtime.md` 新增的 C 章。
+
+## 1. 运行时模式：Connect 把主窗口切到远程 server（`dialog-select-server.tsx`、`main.mjs`）
+
+- SSH 区块每条连接两个按钮：**Connect**（运行时模式）与 **Window**（保留第二轮旧行为：确认框 → 新开隔离远程窗口，主窗口不动）。purpose 必须显式传字面量 `"runtime"`，主进程才进入运行时模式（`main.mjs:1244-1252`）。
+- Connect 成功后不弹确认、不开新窗口：主进程 `runtimeTunnelUp` 记住选择，并经 `openscience:server:use` 把隧道地址推给所有本地窗口（`main.mjs:1111-1118`、`main.mjs:1159-1172`）；工作区订阅后切换活跃 server（`frontend/workspace/src/context/server.tsx:284-291`）。远程工作区窗口没有 preload，不接触 SSH 设施。UI 反馈：toast「Switched to remote runtime」+ 条目 **Runtime** 徽标（`dialog-select-server.tsx:437-439`）。
+- 选择持久化在连接存储的 `runtime` 字段，跨应用重启保留；`setRuntime` 只接受当前列表里存在的 id，`null` 存为字段缺失，旧存储兼容读取（`frontend/desktop/src/ssh-connections.mjs:1232-1239`、持久化 `ssh-connections.mjs:579-598`）。
+- 断开 / 移除当前 runtime 主机：主窗口立即回落本地 sidecar（`main.mjs:1212-1231`）。运行时隧道自动重连的重试耗尽（`RECONNECT_ATTEMPTS = 3`，`ssh-connections.mjs:35`）或该连接 connect 失败（`failed` 事件）时同样自动回落；回落只在"仍是当前选择"时执行，不会覆盖期间新选的 runtime（`main.mjs:1078-1090`）。
+- CSP 放宽：`relaxLoopbackConnectSrc` 在首个窗口加载前注册，把本机回环页面的 `connect-src 'self'` 扩为 `'self' http://127.0.0.1:* ws://127.0.0.1:*`，让运行时切换无需重载页面（`main.mjs:1131-1149`，注册于 `main.mjs:1339-1341`）；只放宽 connect-src、只覆盖 http/ws 回环来源，远程窗口的分区同源策略不变。
+
+## 2. 启动恢复（`main.mjs` restoreRuntime）
+
+- 首个窗口创建完成后 `void restoreRuntime()`（`main.mjs:1386`）在后台恢复上一会话选中的 runtime 连接：启动不等待 SSH——部署/上传可能耗时数分钟，隧道在后台拉起，工作区经 `openscience:server:use` 获知切换（`main.mjs:1178-1197`）。
+- 恢复期间用户改选其他 runtime 时，新选择胜出：restore 模式的 `onTunnelUp` 校验当前选择，迟到的旧隧道返回 `false` 被 connect 拆除。恢复失败（例如记录已被删）只清除失效的选择，并向 stderr 写一行说明，工作区留在本地。
+
+## 3. 本地扩展同步（新增 `frontend/desktop/src/remote-sync.mjs`）
+
+- 时机：connect 流程固定为 探活 → 部署/升级 sidecar（必要时启动/重启远端 server）→ **同步** → 开隧道（`ssh-connections.mjs:1144-1165`）。同步在部署之后、隧道之前；实现注释提示同步进远端 data 的文件在下一次远端 server 启动时被读到（`remote-sync.mjs:16-19`），auth.json 等按请求重读的存储当次即生效（`backend/cli/src/util/jsonstore.ts:36-40`）。
+- 同步清单（`remote-sync.mjs:50-76`，顺序固定；本地缺失的项直接从清单剔除——本地不存在的 auth.json 永远不会删除或清空远端那份）：
+  - `.openscience/user-skills`、`.openscience/installed-skills`、`~/.claude/skills` → 远端对应路径**合并**（远端独有的 skill 保留，同步项只覆盖自己的文件）；
+  - `~/.config/openscience` → 远端 `~/.openscience/remote/config`（远端 server 的 `XDG_CONFIG_HOME`）**整体替换**：先解包到旁路 `<remote>.sync-staging`，全部到位后才 rm + mv 换入，传输中断不破坏在用配置根，失败清理 staging 并如实报错（`ssh-connections.mjs:734-766`）；
+  - 数据根单文件一一复制：`auth.json` / `credentials.json` / `credentials.key` / `mcp-auth.json` / `compute.key` / `settings-compute.json` → `~/.openscience/remote/data/`。
+- 机制：每项在本地用 `tar` 打包（argv 数组、硬超时、stderr 有界，`ssh-connections.mjs:690-717`），经 ssh stdin 流到远端 `tar -xf -` 解包；远端路径一律经 `remoteHomePath()` 锚定远端 `$HOME`（`ssh-connections.mjs:63-65`），命令行不携带本地 home 的绝对拼写。
+
+## 4. 软失败语义
+
+- 任一项同步失败即停止剩余项，connect 发出 `Local extension sync skipped: <原因>` 的 `syncing` 事件后**照常继续到隧道**——同步是便利而非前置条件（`ssh-connections.mjs:1148-1165`）。
+- 失败时远端已有状态原样保留：合并项不动，替换项保留旧配置根、无 staging 残留（`frontend/desktop/test/ssh-connections.test.mjs:928-959`）。
+- 事件消息现状：本地窗口收到该事件，但 UI 只把它映射为 Servers 对话框里条目的状态点（`dialog-select-server.tsx:194-198`、`dialog-select-server.tsx:259-263`），消息文本没有专门展示位——排障靠比对本地与远端对应路径。
+- 无"只同步一次 / 关闭同步"的开关：同步无条件跟随每一次 Connect（运行时与窗口模式共用同一 connect 流程）；唯一间接手段是让本地不存在对应路径（existsSync 过滤，`remote-sync.mjs:75`）。
+
+## 门禁与复核
+
+- `cd frontend/desktop && bun test test/`：**50 pass / 0 fail**（2 文件：ssh-connections 47 用例 + remote-sync 3 用例；本轮新增运行时选择/持久化/拒绝无效 id、同步清单与远端 `$HOME` 锚定、staging 整体替换、软失败语义等用例）。
+- `cd frontend/workspace && bun run typecheck`（tsgo -b）：exit 0。
+- 本节为文档工程师依据最终代码撰写；仓库内未见本轮的独立评审记录，以上只记录本机实际执行的门禁，未运行的门禁未列入。
